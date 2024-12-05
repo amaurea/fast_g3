@@ -10,6 +10,10 @@
 #include <FLAC/stream_decoder.h>
 #include <bzlib.h>
 
+#if NPY_ABI_VERSION < 0x02000000
+  #define PyDataType_ELSIZE(descr) ((descr)->elsize)
+#endif
+
 // Low-level python interface consists of two functions
 // * scan(buffer), which returns an info dictionary
 //   {ndet:int, nsamp:int, detnames:[], fields:{
@@ -416,9 +420,9 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 	for(int32_t di = 0; di < sinfo.ndet; di++) {
 		// No PyHandle needed since SET_ITEM steals the reference
 		PyObject * detname = PyUnicode_FromString(sinfo.detnames[di].c_str()); if(!detname) return NULL;
-		PyList_SET_ITEM(detnames, di, detname);
+		PyList_SET_ITEM(detnames.ptr, di, detname);
 	}
-	PyDict_SetItemString(meta, "detnames", detnames);
+	PyDict_SetItemString(meta, "detnames", detnames.ptr);
 	// Set up the fields
 	PyHandle fields = PyDict_New();
 	for(const auto & [name, field] : sinfo.fields) {
@@ -427,7 +431,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 		for(int32_t dim = 0; dim < field.ndim; dim++) {
 			int64_t val = dim == 0 ? sinfo.nsamp : dim == 1 ? sinfo.ndet : 1;
 			PyObject * pyval = PyLong_FromUnsignedLong(val); if(!pyval) return NULL;
-			PyTuple_SET_ITEM(shape, field.ndim-1-dim, pyval); // steals
+			PyTuple_SET_ITEM(shape.ptr, field.ndim-1-dim, pyval); // steals
 		}
 		// [nseg,6] int64_t numpy array for the segments
 		npy_intp segshape[2] = { (npy_intp)field.segments.size(), 7 };

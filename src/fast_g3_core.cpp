@@ -3,6 +3,7 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <Python.h>
 #include <numpy/arrayobject.h>
+#include <string.h> // memset
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -183,7 +184,11 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	uint8_t times_algo       = buf.read<uint8_t>();   (void)times_algo;
 	int32_t nsamp            = buf.read<int32_t>();
 	int32_t times_nbyte_comp = buf.read<int32_t>();
-	// TODO: Handle times here
+	// Times are int64 ctimes in units of 10 ns
+	// The -4,+4 is because the decoder considers the starting length tag to be
+	// part of the input buffer
+	Segment tseg = { -1, sinfo.nsamp, nsamp, buf.pos-4, times_nbyte_comp+4, 0.0, times_algo };
+	get_field(sinfo.fields, name+"/times", NPY_INT64, 1).segments.push_back(tseg);
 	buf.pos += times_nbyte_comp;
 	buf.pos += 4; // skip names header
 	int64_t ndet             = buf.read<int64_t>();
@@ -214,7 +219,7 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	int32_t signal_nbyte_comp= buf.read<int32_t>();
 
 	sinfo.curnsamp = nsamp;
-	Field & field = get_field(sinfo.fields, name, npy_type, 2);
+	Field & field = get_field(sinfo.fields, name + "/data", npy_type, 2);
 	(void)ndim;
 
 	// Read the detector data
@@ -287,16 +292,6 @@ ScanInfo scan(Buffer & buf) {
 	}
 	return sinfo;
 }
-
-// FIXME: Need quanta for decompression. Store as a double in work and segments.
-// Also add npy_type to work. Work also needs to know how big the output size will be.
-// float32 → (flac int32, corrections int32) → (quanta32) → float32
-// float64 → (flat int32, corrections int64) → (quanta64) → float64
-// Since the corrections are stored as int64, we can't just go the whole way
-// to quanta with an int32 buffer. So we have to special case everything.
-//
-// The decompression implementation in so3g looks pretty reasonable. Maybe there's
-// not that much to win here. We'll see.
 
 template <typename otype, typename itype> void copy_arr(void * odata, const void * idata, int64_t nvalue) {
 	otype *optr = (otype*) odata;
@@ -378,14 +373,21 @@ void add_quanta(const Work & work) {
 	else if(work.npy_type == NPY_FLOAT64) mul_arr_val<int64_t,double>(work.obuf, work.obuf, work.quantum, nsamp);
 }
 
+void zero_buffer(const Work & work) {
+	memset(work.obuf, 0, work.onbyte);
+}
+
 // Process a single work item
 void read_work(const Work & work) {
 	// No compression. Simple memcpy
 	if(work.algo == 0) memcpy(work.obuf, work.ibuf, work.onbyte);
 	else {
 		// First decode the data
+		// bz2 and const usually add to the result from flac,
+		// but in a few cases we start directly from zero instead
 		Buffer ibuf(work.ibuf, work.inbyte);
 		if(work.algo & 1) decode_flac   (work, ibuf);
+		else              zero_buffer   (work);
 		if(work.algo & 2) add_offs_bz2  (work, ibuf);
 		if(work.algo & 4) add_offs_const(work, ibuf);
 		// Then handle the quanta
@@ -408,7 +410,12 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 	if(!PyArg_ParseTuple(args, "y#", &bdata, &bsize)) return NULL;
 	// Scan the file
 	Buffer buf(bdata, bsize);
-	ScanInfo sinfo = scan(buf);
+	ScanInfo sinfo;
+	try { sinfo = scan(buf); }
+	catch (const std::runtime_error & e) {
+		PyErr_SetString(PyExc_IOError, e.what());
+		return NULL;
+	}
 	// Convert to python types
 	PyObject * meta = PyDict_New(); PyHandle delete_meta(meta);
 	PyHandle ndet  = PyLong_FromUnsignedLong(sinfo.ndet); if(!ndet) return NULL;
@@ -444,7 +451,8 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 			row[2] = seg.nsamp;
 			row[3] = seg.buf0;
 			row[4] = seg.nbyte;
-			row[5] = *(int64_t*)&seg.quantum; // hack
+			// hack: store the float64 quantum in the int field
+			memcpy(&row[5], &seg.quantum, 8);
 			row[6] = seg.algo;
 		}
 		// Make field dict to add these to
@@ -462,7 +470,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 }
 
 
-PyObject * read_py(PyObject * self, PyObject * args, PyObject * kwargs) {
+PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	const char * bdata = NULL;
 	Py_ssize_t bsize;
 	PyObject *meta = NULL, *fields=NULL, *dets_in=NULL;
@@ -534,7 +542,11 @@ PyObject * read_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 		}
 	}
 	// Phew! The work list is done. Do the actual work
-	read_worklist(worklist);
+	try { read_worklist(worklist); }
+	catch (const std::runtime_error & e) {
+		PyErr_SetString(PyExc_IOError, e.what());
+		return NULL;
+	}
 	Py_RETURN_NONE;
 }
 
@@ -547,16 +559,19 @@ PyDoc_STRVAR(scan__doc,
 );
 
 PyDoc_STRVAR(read__doc,
-	"read(buffer, meta, fields, dets=None)\n--\n"
+	"extract(buffer, meta, fields, dets=None)\n--\n"
 	"\n"
-	"Read the given fields from the .g3 bytes for the subset of\n"
+	"Extract the given fields from the .g3 bytes for the subset of\n"
 	"detector indices specified, using the metadata provided by\n"
-	"scan(buffer). Returns dictionary of numpy arrays.\n"
+	"scan(buffer). fields is a dictionary of field_name:output_array,\n"
+	"where the output array must have the right shape and dtype. If\n"
+	"a subset of detectors has been requested, this must be reflected\n"
+	"in the shape of these arrays\n"
 );
 
 static PyMethodDef methods[] = {
 	{"scan", scan_py, METH_VARARGS, scan__doc},
-	{"read", (PyCFunction)read_py, METH_VARARGS|METH_KEYWORDS, read__doc},
+	{"extract", (PyCFunction)extract_py, METH_VARARGS|METH_KEYWORDS, read__doc},
 	{NULL, NULL, 0, NULL}
 };
 

@@ -17,50 +17,45 @@ class G3File:
 			self._buffer = ifile.read()
 		self._meta  = scan(self._buffer)
 		self.fields = {key:Field(**val) for key,val in self._meta["fields"].items()}
-	@property
-	def ndet(self): return self._meta["ndet"]
+		self._queue = {}
 	@property
 	def nsamp(self): return self._meta["nsamp"]
-	@property
-	def detnames(self): return self._meta["detnames"]
-	def read(self, fields=None, detinds=None):
-		# If fields is not passed, initialize it to a
-		# list of all our field names
-		if fields is None:
-			fields = self.fields.keys()
-		# If we have a list of field names, replace it
-		# with a dict fieldname:output_array
-		if not hasattr(fields, "keys"):
-			ofields = {}
-			for fieldname in fields:
-				info = self.fields[fieldname]
-				ofields[fieldname] = np.zeros(detshape(info.shape, detinds), info.dtype)
-			fields = ofields
-		else:
-			# Check that we have the right shape and data type
-			for fieldname, arr in fields.items():
-				info  = self.fields[fieldname]
-				shape = detshape(info.shape,detinds)
-				if arr.shape != shape or arr.dtype != info.dtype or arr.strides[-1] != arr.itemsize:
-					raise ValueError("Field %s must have shape %s dtype %s and be contiguous along the last axis" % (fieldname, str(shape), str(info.dtype)))
+	def queue(self, field, rows=None, oarr=None):
+		info  = self.fields[field]
+		# Allocate output array if necessary
+		shape = rowshape(info.shape,rows)
+		if oarr is None: oarr = np.zeros(shape, info.dtype)
+		# Check that everything makes sense
+		if oarr.shape != shape or oarr.dtype != info.dtype or oarr.strides[-1] != oarr.itemsize:
+			raise ValueError("Field %s output array must have shape %s dtype %s and be contiguous along the last axis" % (name, str(shape), str(info.dtype)))
+		# Queue it up
+		self._queue[field] = {"oarr":oarr, "rows":rows}
+	def read(self):
+		# If we don't have a queue, then read everything
+		if len(self._queue) == 0:
+			for name in self.fields:
+				self.queue(name)
 		# Do the actual extraction
-		extract(self._buffer, self._meta, fields, dets=detinds)
-		return fields
+		extract(self._buffer, self._meta, self._queue)
+		# Format output
+		result = {name:request["oarr"] for name,request in self._queue.items()}
+		self._queue = {}
+		return result
 	def __repr__(self):
 		fieldnames = sorted(self.fields.keys())
 		nchar      = max([len(fn) for fn in fieldnames])+2
-		msg = "G3File('%s', ndet=%d, nsamp=%d, fields={\n" % (self.fname, self.ndet, self.nsamp)
+		msg = "G3File('%s', nsamp=%d, fields={\n" % (self.fname, self.nsamp)
 		for fieldname, fdesc in self.fields.items():
 			msg += " %-*s: %s,\n" % (nchar, "'"+fieldname+"'", str(fdesc))
 		msg += "}"
 		return msg
 
 class Field:
-	def __init__(self, shape, dtype, segments):
-		self.shape, self.dtype, self.segments = shape, dtype, segments
+	def __init__(self, shape, dtype, names, segments):
+		self.shape, self.dtype, self.names, self.segments = shape, dtype, names, segments
 	def __repr__(self):
 		return "Field(shape=%s, dtype=%s, %d segments)" % (str(self.shape), str(self.dtype), len(self.segments))
 
-def detshape(shape, dets):
+def rowshape(shape, dets):
   if dets is None or len(shape)==1: return shape
   else: return (len(dets),shape[1])

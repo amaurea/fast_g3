@@ -15,6 +15,14 @@
   #define PyDataType_ELSIZE(descr) ((descr)->elsize)
 #endif
 
+// Need to make some changes with how the detectors are handled.
+// I thought any 2-axis array would have detectors as the first
+// axis, but that's wrong. Only supertimestreams have two axes,
+// and each has their own names. This information should therefore
+// not be attached to ScanInfo, but instead to the field, which
+// will now have a names array. We will still assume this is
+// attached to the first axis.
+
 // Low-level python interface consists of two functions
 // * scan(buffer), which returns an info dictionary
 //   {ndet:int, nsamp:int, detnames:[], fields:{
@@ -25,17 +33,18 @@
 //   to all the reads to happen as much in parallel as possible.
 
 using std::string;
-struct Segment  { int64_t det, samp0, nsamp, buf0, nbyte; double quantum; uint8_t algo; };
-typedef std::vector<Segment> Segments;
-struct Field    { int npy_type, ndim; Segments segments; };
+using std::vector;
+struct Segment  { int64_t row, samp0, nsamp, buf0, nbyte; double quantum; uint8_t algo; };
+typedef vector<Segment> Segments;
+typedef vector<string> Names;
+struct Field    { int npy_type, ndim; Names names; Segments segments; };
 typedef std::unordered_map<string,Field> Fields;
-typedef std::vector<string> Names;
 struct ScanInfo {
-	ScanInfo():ndet(0),nsamp(0),curnsamp(0) {}
-	int64_t ndet, nsamp, curnsamp; Names detnames; Fields fields;
+	ScanInfo():nsamp(0),curnsamp(0) {}
+	int64_t nsamp, curnsamp; Fields fields;
 };
 struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte; double quantum; int npy_type, itemsize; uint8_t algo; };
-typedef std::vector<Work> WorkList;
+typedef vector<Work> WorkList;
 
 // Used to ensure python resources are freed.
 // Set ptr to NULL if you change your mind
@@ -138,6 +147,10 @@ int numpy_type_size(int npy_type) {
 
 // unordered_map only got contains() in C++20, so use this to be safe}
 bool contains(const Fields & fields, const string & name) { return fields.find(name) != fields.end(); }
+bool contains(PyObject * obj, const char * name) {
+	PyHandle pyname = PyUnicode_FromString(name);
+	return PyDict_Contains(obj, pyname);
+}
 Field & get_field(Fields & fields, const string & name, int npy_type, int ndim) {
 	if(!contains(fields, name)) {
 		Field new_field = { npy_type, ndim };
@@ -162,7 +175,7 @@ void process_timesamplemap(Buffer & buf, int32_t nfield, const string & prefix, 
 		if(npy_type >= 0) {
 			subbuf.pos += 12;
 			Segment seg;
-			seg.det   = -1;
+			seg.row   = -1;
 			seg.samp0 = sinfo.nsamp;
 			seg.nsamp = subbuf.read<int64_t>();
 			seg.nbyte = seg.nsamp*numpy_type_size(npy_type);
@@ -191,15 +204,13 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	get_field(sinfo.fields, name+"/times", NPY_INT64, 1).segments.push_back(tseg);
 	buf.pos += times_nbyte_comp;
 	buf.pos += 4; // skip names header
-	int64_t ndet             = buf.read<int64_t>();
-	// Loop through the detectors
-	bool need_dets = sinfo.detnames.empty();
-	for(int32_t di = 0; di < ndet; di++) {
-		int64_t dlen = buf.read<int64_t>();
-		string dname  = buf.read_string(dlen);
-		if(need_dets) sinfo.detnames.push_back(dname);
+	int64_t nname            = buf.read<int64_t>();
+	// Loop through the row names
+	Names names(nname);
+	for(int32_t ni = 0; ni < nname; ni++) {
+		int64_t nlen = buf.read<int64_t>();
+		names[ni] = buf.read_string(nlen);
 	}
-	if(need_dets) sinfo.ndet  = sinfo.detnames.size();
 	// Prepare for the data
 	int64_t npy_type          = buf.read<int64_t>();
 	int itemsize = numpy_type_size(npy_type);
@@ -210,26 +221,27 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	uint8_t data_algo        = buf.read<uint8_t>();  (void)data_algo;
 	int64_t nquanta          = buf.read<int64_t>();
 	// We need the quanta for decoding
-	std::vector<double> quanta(nquanta);
+	vector<double> quanta(nquanta);
 	if(nquanta > 0)
 		buf.read_raw(8*nquanta, &quanta[0]);
 	int64_t noffset          = buf.read<int64_t>();
-	std::vector<int32_t> offsets(noffset);
+	vector<int32_t> offsets(noffset);
 	buf.read_raw(noffset*4, &offsets[0]);
 	int32_t signal_nbyte_comp= buf.read<int32_t>();
 
 	sinfo.curnsamp = nsamp;
 	Field & field = get_field(sinfo.fields, name + "/data", npy_type, 2);
+	if(field.names.empty()) field.names.swap(names);
 	(void)ndim;
 
-	// Read the detector data
+	// Read the row data
 	Buffer dbuf(buf);
 
 	int32_t none_size = 0, flac_size = 0, bz_size = 0, const_size = 0, tot_size = 0;
-	ssize_t det_start, det_end;
-	for(int32_t di = 0; di < ndet; di++) {
+	ssize_t row_start, row_end;
+	for(int32_t ni = 0; ni < nname; ni++) {
 		uint8_t used_algo = dbuf.read<uint8_t>();
-		det_start = dbuf.pos;
+		row_start = dbuf.pos;
 		if(used_algo == 0) {
 			none_size = nsamp*itemsize;
 			dbuf.pos += none_size;
@@ -247,11 +259,11 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 				dbuf.pos  += const_size;
 			}
 		}
-		det_end   = dbuf.pos;
+		row_end   = dbuf.pos;
 		tot_size = none_size + flac_size + bz_size + const_size; (void)tot_size;
-		// Ok, done parsing this detector
-		double quantum = nquanta > 0 ? quanta[di] : 1.0;
-		Segment seg = { di, sinfo.nsamp, nsamp, det_start, det_end-det_start, quantum, used_algo };
+		// Ok, done parsing this row
+		double quantum = nquanta > 0 ? quanta[ni] : 1.0;
+		Segment seg = { ni, sinfo.nsamp, nsamp, row_start, row_end-row_start, quantum, used_algo };
 		field.segments.push_back(seg);
 	}
 	buf.pos += signal_nbyte_comp;
@@ -326,7 +338,7 @@ void decode_flac(const Work & work, Buffer & ibuf) {
 	int64_t isize = ibuf.read<uint32_t>();
 	// Decode into a temporary output buffer
 	int nsamp = work.onbyte/work.itemsize;
-	std::vector<int32_t> tmp(nsamp);
+	vector<int32_t> tmp(nsamp);
 	FlacDecoder flac;
 	if(flac.decode(ibuf.data+ibuf.pos, &tmp[0], isize, nsamp*4))
 		throw std::runtime_error("Error decoding FLAC data");
@@ -345,7 +357,7 @@ void add_offs_bz2(const Work & work, Buffer & ibuf) {
 	// Can save memory by setting the "small" (second to last)
 	// argument to 1, but this halves the decompression speed
 	// according to the documentation
-	std::vector<char> tmp(work.onbyte);
+	vector<char> tmp(work.onbyte);
 	int err = BZ2_bzBuffToBuffDecompress(&tmp[0], &osize, (char*)ibuf.data+ibuf.pos, isize, 0, 0);
 	if(err != BZ_OK) throw std::runtime_error("Error decoding BZ2 data");
 	// Add to the actual output buffer
@@ -418,27 +430,25 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 	}
 	// Convert to python types
 	PyObject * meta = PyDict_New(); PyHandle delete_meta(meta);
-	PyHandle ndet  = PyLong_FromUnsignedLong(sinfo.ndet); if(!ndet) return NULL;
-	PyDict_SetItemString(meta, "ndet", ndet);
 	PyHandle nsamp = PyLong_FromUnsignedLong(sinfo.nsamp);if(!nsamp)return NULL;
 	PyDict_SetItemString(meta, "nsamp", nsamp);
-	// Set up the detector names
-	PyHandle detnames = PyList_New(sinfo.ndet);
-	for(int32_t di = 0; di < sinfo.ndet; di++) {
-		// No PyHandle needed since SET_ITEM steals the reference
-		PyObject * detname = PyUnicode_FromString(sinfo.detnames[di].c_str()); if(!detname) return NULL;
-		PyList_SET_ITEM(detnames.ptr, di, detname);
-	}
-	PyDict_SetItemString(meta, "detnames", detnames.ptr);
 	// Set up the fields
 	PyHandle fields = PyDict_New();
 	for(const auto & [name, field] : sinfo.fields) {
 		PyHandle dtype = PyArray_DescrFromType(field.npy_type);
+		// Set up the shape
+		int nname = field.names.size();
 		PyHandle shape = PyTuple_New(field.ndim);
 		for(int32_t dim = 0; dim < field.ndim; dim++) {
-			int64_t val = dim == 0 ? sinfo.nsamp : dim == 1 ? sinfo.ndet : 1;
+			int64_t val = dim == 0 ? sinfo.nsamp : dim == 1 ? nname : 1;
 			PyObject * pyval = PyLong_FromUnsignedLong(val); if(!pyval) return NULL;
 			PyTuple_SET_ITEM(shape.ptr, field.ndim-1-dim, pyval); // steals
+		}
+		// Set up the name list
+		PyHandle names = PyTuple_New(nname);
+		for(int ni = 0; ni < nname; ni++) {
+			PyObject * pyname = PyUnicode_FromString(field.names[ni].c_str()); if(!pyname) return NULL;
+			PyTuple_SET_ITEM(names.ptr, ni, pyname); // steals
 		}
 		// [nseg,6] int64_t numpy array for the segments
 		npy_intp segshape[2] = { (npy_intp)field.segments.size(), 7 };
@@ -446,7 +456,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 		for(unsigned int si = 0; si < field.segments.size(); si++) {
 			const Segment & seg = field.segments[si];
 			int64_t * row = (int64_t*)PyArray_GETPTR2((PyArrayObject*)segments.ptr, si, 0);
-			row[0] = seg.det;
+			row[0] = seg.row;
 			row[1] = seg.samp0;
 			row[2] = seg.nsamp;
 			row[3] = seg.buf0;
@@ -459,6 +469,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 		PyHandle pyfield = PyDict_New();
 		PyDict_SetItemString(pyfield, "dtype", dtype);
 		PyDict_SetItemString(pyfield, "shape", shape);
+		PyDict_SetItemString(pyfield, "names", names);
 		PyDict_SetItemString(pyfield, "segments", segments);
 		// And add this field to the fields list
 		PyDict_SetItemString(fields, name.c_str(), pyfield);
@@ -473,29 +484,13 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	const char * bdata = NULL;
 	Py_ssize_t bsize;
-	PyObject *meta = NULL, *fields=NULL, *dets_in=NULL;
-	PyHandle hdets;
-	static const char * kwlist[] = {"buffer", "meta", "fields", "dets", NULL};
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y#OO|O", (char**)kwlist, &bdata, &bsize, &meta, &fields, &dets_in)) return NULL;
+	PyObject *meta = NULL, *fields=NULL;
+	static const char * kwlist[] = {"buffer", "meta", "fields", NULL};
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y#OO", (char**)kwlist, &bdata, &bsize, &meta, &fields)) return NULL;
 	// Extract field dict from meta. GetItem gives borrowed ref, so no PyHandle
 	PyObject * meta_fields = PyDict_GetItemString(meta, "fields"); if(!fields)   return NULL;
-	PyObject * obj_ndet    = PyDict_GetItemString(meta, "ndet");   if(!obj_ndet) return NULL;
 	PyObject * obj_nsamp   = PyDict_GetItemString(meta, "nsamp");  if(!obj_nsamp)return NULL;
-	int64_t ndet  = PyLong_AsLong(obj_ndet); if(PyErr_Occurred()) return NULL;
-	//int64_t nsamp = PyLong_AsLong(obj_nsamp);if(PyErr_Occurred()) return NULL;
-	// Detector list
-	if(!dets_in || dets_in == Py_None) hdets.ptr = PyArray_Arange(0, ndet, 1, NPY_INT);
-	else hdets.ptr = PyArray_ContiguousFromAny(dets_in, NPY_INT, 1, 1);
-	if(!hdets) return NULL;
-	// Make a mapping from the full detector list to the position in dets.
-	// This will let us ensure the detectors are returned in the requested order
-	std::unordered_map<int,int> detmap;
-	npy_intp nodets = PyArray_DIM((PyArrayObject*)hdets.ptr,0);
-	for(npy_intp di = 0; di < nodets; di++) {
-		int det = *(int*)PyArray_GETPTR1((PyArrayObject*)hdets.ptr, di);
-		detmap[det] = di;
-	}
-	// fields = {name:arr, name:arr,...}
+	// fields = {name:{oarr:arr,rows:rows},...}
 	// Build the work array, which specifies all the information we need to decode
 	// and copy each segment
 	WorkList worklist;
@@ -504,26 +499,44 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	while((name = PyIter_Next(iterator))) {
 		PyHandle del_name(name);
 		// Look up this in metadata
-		PyObject * finfo  = PyDict_GetItem(meta_fields, name); if(!finfo) return NULL;
+		PyObject * finfo  = PyDict_GetItem(meta_fields, name);   if(!finfo) return NULL;
+		PyObject * inames = PyDict_GetItemString(finfo, "names");if(!inames)return NULL;
 		PyObject * ishape = PyDict_GetItemString(finfo, "shape");if(!ishape)return NULL;
-		long ndim = PyTuple_Size(ishape);
+		long ndim  = PyObject_Size(ishape); if(PyErr_Occurred()) return NULL;
+		int  nname = PyObject_Size(inames); if(PyErr_Occurred()) return NULL;
 		PyArray_Descr * dtype = (PyArray_Descr*)PyDict_GetItemString(finfo, "dtype"); if(!dtype) return NULL;
 		int npy_type      = dtype->type_num;
 		int itemsize      = PyDataType_ELSIZE(dtype);
+		// fields will now be {name:{oarr:,(optional)rows:}}
+		PyObject * oinfo  = PyDict_GetItem(fields, name); if(!oinfo) return NULL;
+		// Selected rows
+		PyHandle hrows;
+		if(!contains(oinfo, "rows") || PyDict_GetItemString(oinfo, "rows") == Py_None)
+			hrows.ptr = PyArray_Arange(0, nname, 1, NPY_INT);
+		else hrows.ptr = PyArray_ContiguousFromAny(PyDict_GetItemString(oinfo, "rows"), NPY_INT, 1, 1);
+		if(!hrows) return NULL;
+		// Make a mapping from the full set of rows to the ones we ask for.
+		// This will let us ensure the values are returned in the requested order
+		std::unordered_map<int,int> rowmap;
+		npy_intp nrow = PyArray_DIM((PyArrayObject*)hrows.ptr,0);
+		for(npy_intp ri = 0; ri < nrow; ri++) {
+			int row = *(int*)PyArray_GETPTR1((PyArrayObject*)hrows.ptr, ri);
+			rowmap[row] = ri;
+		}
 		// Get the output array. Python side must ensure this is
 		// contiguous and has the right shape and dtype
-		PyArrayObject * arr = (PyArrayObject*)PyDict_GetItem(fields, name); if(!arr)   return NULL;
+		PyArrayObject * arr = (PyArrayObject*)PyDict_GetItemString(oinfo, "oarr"); if(!arr)   return NULL;
 		// Loop through the segments
 		PyArrayObject * segments = (PyArrayObject*)PyDict_GetItemString(finfo, "segments"); if(!segments) return NULL;
 		if(PyArray_NDIM(segments) != 2 || PyArray_TYPE(segments) != NPY_INT64 || PyArray_DIM(segments,1) != 7) return NULL;
 		npy_intp nseg = PyArray_DIM(segments,0);
 		for(npy_intp seg = 0; seg < nseg; seg++) {
-			int64_t det   = *(int64_t*)PyArray_GETPTR2(segments, seg, 0);
-			int64_t ind   = 0;
-			if(det >= 0) {
-				auto it = detmap.find(det);
-				// Skip if this is an unwanted detector
-				if(it == detmap.end()) continue;
+			int64_t row  = *(int64_t*)PyArray_GETPTR2(segments, seg, 0);
+			int64_t ind  = 0;
+			if(row >= 0) {
+				auto it = rowmap.find(row);
+				// Skip if this is an unwanted row
+				if(it == rowmap.end()) continue;
 				ind = it->second;
 			}
 			int64_t samp0 = *(int64_t*)PyArray_GETPTR2(segments, seg, 1);
@@ -559,14 +572,15 @@ PyDoc_STRVAR(scan__doc,
 );
 
 PyDoc_STRVAR(read__doc,
-	"extract(buffer, meta, fields, dets=None)\n--\n"
+	"extract(buffer, meta, fields)\n--\n"
 	"\n"
 	"Extract the given fields from the .g3 bytes for the subset of\n"
 	"detector indices specified, using the metadata provided by\n"
-	"scan(buffer). fields is a dictionary of field_name:output_array,\n"
-	"where the output array must have the right shape and dtype. If\n"
-	"a subset of detectors has been requested, this must be reflected\n"
-	"in the shape of these arrays\n"
+	"scan(buffer). fields is a dictionary of field_name:{\n"
+	"\"oarr\":output_array,\"rows\":rows}, where the output array\n"
+	"must have the right shape and dtype. The optional rows entry\n"
+	"contains a list of rows to ask for for 2d fields, and the shape\n"
+	"of the output array must reflect the number of rows requested\n"
 );
 
 static PyMethodDef methods[] = {

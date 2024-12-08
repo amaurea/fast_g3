@@ -41,7 +41,7 @@ class G3File:
 		self._queue = {}
 	@property
 	def nsamp(self): return self._meta["nsamp"]
-	def read_field(self, field_name, rows=None, oarr=None):
+	def read_field(self, field_name, rows=None, oarr=None, allocator=None):
 		"""Read a single field from the file. If you want more than
 		just one field, consider using read() instead.
 
@@ -55,10 +55,10 @@ class G3File:
 		  after row selection.
 
 		Returns a numpy array with the values from the field."""
-		request = {field_name:self._prepare_request(field_name, rows=rows, oarr=oarr)}
+		request = {field_name:self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)}
 		extract(self._buffer, self._meta, request)
 		return request[field_name]["oarr"]
-	def queue(self, field_name, rows=None, oarr=None):
+	def queue(self, field_name, rows=None, oarr=None, allocator=None):
 		"""Queue up a field to be read. All queued fields will
 		be read in parallel and returned by a subsequent read() call.
 
@@ -70,8 +70,8 @@ class G3File:
 		* oarr: Write the output to this array. It must be contiguous
 		  along the last axis, and match the dtype and shape of the fied
 		  after row selection."""
-		self._queue[field_name] = self._prepare_request(field_name, rows=rows, oarr=oarr)
-	def read(self):
+		self._queue[field_name] = self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)
+	def read(self, allocator=None):
 		"""Read all the queued-up fields in parallel, or every field if
 		queue() was not used.
 
@@ -80,7 +80,7 @@ class G3File:
 		# If we don't have a queue, then read everything
 		if len(self._queue) == 0:
 			for name in self.fields:
-				self.queue(name)
+				self.queue(name, allocator=allocator)
 		# Do the actual extraction
 		extract(self._buffer, self._meta, self._queue)
 		# Format output
@@ -100,11 +100,12 @@ class G3File:
 		# Clean up memory. The buffer contains the whole raw file
 		# read into memory
 		self._buffer = None
-	def _prepare_request(self, field_name, rows=None, oarr=None):
+	def _prepare_request(self, field_name, rows=None, oarr=None, allocator=None):
 		info  = self.fields[field_name]
 		# Allocate output array if necessary
 		shape = rowshape(info.shape,rows)
-		if oarr is None: oarr = np.zeros(shape, info.dtype)
+		if allocator is None: allocator = np
+		if oarr is None: oarr = allocator.empty(shape, info.dtype)
 		# Check that everything makes sense
 		if oarr.shape != shape or oarr.dtype != info.dtype or oarr.strides[-1] != oarr.itemsize:
 			raise ValueError("Field %s output array must have shape %s dtype %s and be contiguous along the last axis" % (name, str(shape), str(info.dtype)))
@@ -123,9 +124,10 @@ class Field:
 		return "Field(shape=%s,dtype=%s,names:%s)" % (str(self.shape), str(self.dtype), format_names(self.names,35))
 
 @contextmanager
-def async_read(fname):
+def async_read(fname, allocator=None):
 	size = os.path.getsize(fname)
-	buf  = bytes(size)
+	if allocator: buf = allocator.bytes(size)
+	else:         buf = bytearray(size)
 	task = start_async_read(fname, buf)
 	try:
 		yield buf
@@ -133,10 +135,19 @@ def async_read(fname):
 		end_async_read(task)
 
 class G3MultiFile:
-	def __init__(self, fnames):
+	def __init__(self, fnames, reuse="full"):
 		self.fnames = fnames
-		# No async for the first file
-		self.g3file = G3File(fnames[0])
+		# Set up our allocators
+		if reuse not in ["full","partial","none"]:
+			raise ValuError("Unknown buffer reuse strategy '%s'" % str(reuse))
+		batype = BufAlloc if reuse in ["full","partial"] else DummyAlloc
+		fatype = BufAlloc if reuse in ["full"] else DummyAlloc
+		self.ballocs = [batype("buf%d" % i) for i in range(2)]
+		self.falloc  = fatype("fields")
+		# First file doesn't benefit from async, but easiest to do it
+		# this way anyway in light of the allocator
+		with async_read(fnames[0], allocator=self.ballocs[0]) as buf: pass
+		self.g3file = G3File(fnames[0], buf)
 		# This meta is only representative of the first file
 		self._meta  = self.g3file._meta
 		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
@@ -148,16 +159,26 @@ class G3MultiFile:
 	def read(self):
 		for fi in range(self.nfile-1):
 			# Start the next read while we work
-			with async_read(self.fnames[fi+1]) as buf:
+			with async_read(self.fnames[fi+1], allocator=self.ballocs[1]) as buf:
 				for field_name, val in self._queue.items():
-					self.g3file.queue(field_name, **val)
+					self.g3file.queue(field_name, **val, allocator=self.falloc)
 				yield self.g3file.read()
 			# Use newly read bytes to set up new file
 			self.g3file = G3File(self.fnames[fi+1], buf)
+			# Invalidate memory we're done with.
+			self.falloc.reset()
+			self.ballocs[0].reset()
+			# Swap file buffer allocators, so we overwrite the oldest
+			# buffer next time
+			self.ballocs = self.ballocs[::-1]
 		# Last file doesn't have a next one to start
 		for field_name, val in self._queue.items():
-			self.g3file.queue(field_name, **val)
+			self.g3file.queue(field_name, **val, allocator=self.falloc[1])
 		yield self.g3file.read()
+		# Reset the last buffers
+		self.falloc.reset()
+		self.ballocs[0].reset()
+		self._queue = {}
 	# We do not support read_field here, as it would
 	# be too inefficient
 
@@ -180,4 +201,78 @@ def format_names(names, maxlen):
 	return "["+msg+"]"
 
 # Alias to make it more like python's open()
-open_g3 = G3File
+open_g3    = G3File
+
+############################
+# Manual memory management #
+############################
+
+# Unecpectedly simply freeing up buffers between each
+# file read in the multi-file reader took 40% of the time!
+# This was very hard to track down as it happened at the end
+# of scopes. The stuff below implements semi-manual memory
+# management in the form of growable, reusable buffers.
+
+# Yuck, manual memory management. But it's needed to avoid
+# losing most of the async read speedup
+def ceil(a,b): return (a+b-1)//b
+def round_up(a,b): return ceil(a,b)*b
+
+# Bump allocator for numpy. Hands out memory from an internal buffer.
+# If it runs out of memory, replaces buffer with a larger one. Previous
+# buffer will still be valid until reset is called. When used in a
+# steady-state loop no memory allocation will happen after the first
+# iteration
+class BufAlloc:
+	def __init__(self, name="[unnamed]", size=512, growth_factor=1.5):
+		self.pos    = 0
+		self.align  = 8
+		self.size   = int(size)
+		self.buffer = np.empty(ceil(self.size,8),np.float64).view(np.uint8)
+		self.old    = []
+		self.name   = name
+		self.growth_factor = growth_factor
+	def bytes(self, nbyte):
+		if self.pos + nbyte > self.size:
+			# Not enough space. Make a new buffer
+			self.old.append(self.buffer)
+			self.size   = int(nbyte*self.growth_factor)
+			self.buffer = np.empty(ceil(self.size,8),np.float64).view(np.uint8)
+			self.pos    = 0
+		res = self.buffer[self.pos:self.pos+nbyte]
+		self.pos = round_up(self.pos+nbyte,self.align)
+		return res
+	def empty(self, shape, dtype=np.float32):
+		# Get memory to place this array in
+		buf = self.bytes(np.prod(shape)*np.dtype(dtype).itemsize)
+		return np.frombuffer(buf, dtype).reshape(shape)
+	def full(self, shape, val, dtype=np.float32):
+		arr    = self.empty(shape, dtype=dtype)
+		arr[:] = val
+		return arr
+	def zeros(self, shape, dtype=np.float32):
+		return self.full(shape, 0, dtype=dtype)
+	def array(self, arr):
+		"""Like empty(), but based on the data of an existing array, which
+		can be either a numpy or cupy array."""
+		res = self.empty(arr.shape, arr.dtype)
+		res[:] = arr
+		return res
+	def reset(self):
+		"""Reset memory. All allocated arrays become invalid, but the
+		primary buffer will not be freed, so it's ready to hand out
+		memory again"""
+		self.old = []
+		self.pos = 0
+	def __repr__(self): return "BufAlloc(name='%s', size=%d, pos=%d)" % (self.name, self.size, self.pos)
+
+class DummyAlloc:
+	def __init__(self, name="[unnamed]", size=512, growth_factor=1.5):
+		self.name   = name
+	def bytes(self, nbyte): return bytearray(nbyte)
+	def empty(self, shape, dtype=np.float32): return np.empty(shape, dtype)
+	def full(self, shape, val, dtype=np.float32): return np.full(shape, val, dtype)
+	def zeros(self, shape, dtype=np.float32): return np.zeros(shape, dtype)
+	def array(self, arr): return np.array(arr)
+	def reset(self): pass
+	def __repr__(self): return "DummyAlloc(name='%s')" % (self.name)

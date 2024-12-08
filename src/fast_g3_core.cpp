@@ -472,11 +472,10 @@ int end_async_read(AioTask & task) {
 extern "C" {
 
 static PyObject * scan_py(PyObject * self, PyObject * args) {
-	const char * bdata;
-	Py_ssize_t bsize;
-	if(!PyArg_ParseTuple(args, "y#", &bdata, &bsize)) return NULL;
+	Py_buffer pybuf;
+	if(!PyArg_ParseTuple(args, "y*", &pybuf)) return NULL;
 	// Scan the file
-	Buffer buf(bdata, bsize);
+	Buffer buf(pybuf.buf, pybuf.len);
 	ScanInfo sinfo;
 	try { sinfo = scan(buf); }
 	catch (const std::runtime_error & e) {
@@ -537,11 +536,10 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 
 
 PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
-	const char * bdata = NULL;
-	Py_ssize_t bsize;
+	Py_buffer pybuf;
 	PyObject *meta = NULL, *fields=NULL;
 	static const char * kwlist[] = {"buffer", "meta", "fields", NULL};
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y#OO", (char**)kwlist, &bdata, &bsize, &meta, &fields)) return NULL;
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*OO", (char**)kwlist, &pybuf, &meta, &fields)) return NULL;
 	// Extract field dict from meta. GetItem gives borrowed ref, so no PyHandle
 	PyObject * meta_fields = PyDict_GetItemString(meta, "fields"); if(!fields)   return NULL;
 	PyObject * obj_nsamp   = PyDict_GetItemString(meta, "nsamp");  if(!obj_nsamp)return NULL;
@@ -605,7 +603,7 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 			else if(ndim == 2) dest = (void*)PyArray_GETPTR2(arr, ind, samp0);
 			else return NULL;
 			// This should be all we need to know
-			Work work = { bdata+buf0, dest, nbyte, nsamp*itemsize, quantum, npy_type, itemsize, algo };
+			Work work = { (char*)pybuf.buf+buf0, dest, nbyte, nsamp*itemsize, quantum, npy_type, itemsize, algo };
 			worklist.push_back(work);
 		}
 	}
@@ -620,11 +618,10 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 
 static PyObject * start_async_read_py(PyObject * self, PyObject * args) {
 	const char * fname;
-	char * obuf;
-	ssize_t obytes;
-	if(!PyArg_ParseTuple(args, "sy#", &fname, &obuf, &obytes)) return NULL;
+	Py_buffer pybuf;
+	if(!PyArg_ParseTuple(args, "sy*", &fname, &pybuf)) return NULL;
 	std::shared_ptr<AioTask> task;
-	try { task = start_async_read(fname, obuf, obytes); }
+	try { task = start_async_read(fname, (char*)pybuf.buf, pybuf.len); }
 	catch(const std::runtime_error & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;

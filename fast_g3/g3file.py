@@ -1,6 +1,6 @@
 from .fast_g3_core import scan, extract, start_async_read, end_async_read
 from contextlib import contextmanager
-import numpy as np, os
+import numpy as np, os, time
 
 class G3File:
 	"""G3File: High-level interface for fast_g3.
@@ -32,11 +32,14 @@ class G3File:
 		determine which fields are persent. This can be memory-
 		heavy, but is needed for performance reasons."""
 		self.fname  = fname
+		self._timer = Timer(["read","alloc","scan","extract"])
 		if buffer is None:
-			with open(self.fname, "rb") as ifile:
-				self._buffer = ifile.read()
+			with self._timer("read"):
+				with open(self.fname, "rb") as ifile:
+					self._buffer = ifile.read()
 		else: self._buffer = buffer
-		self._meta  = scan(self._buffer)
+		with self._timer("scan"):
+			self._meta  = scan(self._buffer)
 		self.fields = {key:Field(**val,owner=self,field_name=key) for key,val in self._meta["fields"].items()}
 		self._queue = {}
 	@property
@@ -56,7 +59,8 @@ class G3File:
 
 		Returns a numpy array with the values from the field."""
 		request = {field_name:self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)}
-		extract(self._buffer, self._meta, request)
+		with self._timer("extract"):
+			extract(self._buffer, self._meta, request)
 		return request[field_name]["oarr"]
 	def queue(self, field_name, rows=None, oarr=None, allocator=None):
 		"""Queue up a field to be read. All queued fields will
@@ -82,7 +86,8 @@ class G3File:
 			for name in self.fields:
 				self.queue(name, allocator=allocator)
 		# Do the actual extraction
-		extract(self._buffer, self._meta, self._queue)
+		with self._timer("extract"):
+			extract(self._buffer, self._meta, self._queue)
 		# Format output
 		result = {name:request["oarr"] for name,request in self._queue.items()}
 		self._queue = {}
@@ -100,12 +105,15 @@ class G3File:
 		# Clean up memory. The buffer contains the whole raw file
 		# read into memory
 		self._buffer = None
+	@property
+	def times(self): return self._timer.data
 	def _prepare_request(self, field_name, rows=None, oarr=None, allocator=None):
 		info  = self.fields[field_name]
 		# Allocate output array if necessary
 		shape = rowshape(info.shape,rows)
 		if allocator is None: allocator = np
-		if oarr is None: oarr = allocator.empty(shape, info.dtype)
+		with self._timer("alloc"):
+			if oarr is None: oarr = allocator.empty(shape, info.dtype)
 		# Check that everything makes sense
 		if oarr.shape != shape or oarr.dtype != info.dtype or oarr.strides[-1] != oarr.itemsize:
 			raise ValueError("Field %s output array must have shape %s dtype %s and be contiguous along the last axis" % (name, str(shape), str(info.dtype)))
@@ -123,20 +131,92 @@ class Field:
 	def __repr__(self):
 		return "Field(shape=%s,dtype=%s,names:%s)" % (str(self.shape), str(self.dtype), format_names(self.names,35))
 
-@contextmanager
-def async_read(fname, allocator=None):
-	size = os.path.getsize(fname)
-	if allocator: buf = allocator.bytes(size)
-	else:         buf = bytearray(size)
-	task = start_async_read(fname, buf)
-	try:
-		yield buf
-	finally:
-		end_async_read(task)
+# This would be simpler using contextmanager, but I
+# wanted to also be able to provide timing information
+class AsyncReader:
+	def __init__(self, fname, allocator=None):
+		self.fname     = fname
+		self.allocator = allocator
+		self._timer    = Timer(["getsize","alloc","start","finish"])
+		with self._timer("getsize"):
+			self.size    = os.path.getsize(self.fname)
+		with self._timer("alloc"):
+			if allocator: self.buf = allocator.bytes(self.size)
+			else:         self.buf = bytearray(self.size)
+	def start(self):
+		with self._timer("start"):
+			self.task = start_async_read(self.fname, self.buf)
+		return self
+	def finish(self):
+		with self._timer("finish"):
+			end_async_read(self.task)
+		return self
+	def __enter__(self):
+		return self.start()
+	def __exit__(self, type, value, traceback):
+		# Do not clean up buffer here, since the
+		# whole point is to access the data after the
+		# read is done
+		self.finish()
+	@property
+	def times(self): return self._timer.data
+
+async_read = AsyncReader
 
 class G3MultiFile:
+	"""G3File: High-level interface interleaving the reading
+	and extraction of multiple g3 files. Uses asynchronous
+	file reads (aio_read) behind the scenes.
+
+	Example usage:
+
+	with G3MultiFile(["file1.g3","file2.g3",...,"fileN.g3"]) as f:
+		# Print the fields. Extracted from the first file. Number
+		# of samples shown as "?" since the total length across the
+		# files is unknown
+		print(f)
+		# Select some fields for reading. Same syntax as G3File
+		f.queue("signal/time")
+		f.queue("signal/data", rows=[0,10,20,30])
+		f.queue("ancil/az_end")
+		# Process the data for all the files
+		for filedata in f.read():
+			do_something_with_filedata()
+
+	Due to slow garbage collection with the numpy arrays involved,
+	G3MultiFile reuses buffers internally. There are three modes,
+	controlled with the "reuse" argument in __init__:
+	* "full" (default): Reuse both file buffers and output array buffers.
+	  This is fastest, but means that the data yielded from read() is only
+	  valid for that iteration - by the time of the next yield it will be
+	  invalid. You must therefore copy the data if you want to keep it
+	  around.
+	* "partial": Reuse only the file buffers. Use this if the behavior in
+	  "full" is problematic for you. Medium speed.
+	* "none": Don't reuse any buffers. Slowest, with no advantages compared
+	  to "partial".
+
+	Timing information can be accessed through .times and .cum_times, both
+	of which are dictionaries {name:[t,n]}, where name is one of
+	["getsize","alloc","start","finish","scan","extract","free"]
+	representing internal operations. For .times t is the time spent in
+	each of these since the last yield and n is the number of invocations.
+	For .cum_times it's the same, but since the beginning of the read.
+	Note that for reuse != "full" there may be hidden time losses outside
+	of the reading code itself, e.g. when you free the data yielded from
+	read (which can happen as part of your for loop).
+
+	open_multi is an alias for G3MultiFile.
+
+	Built on the low-level interface scan(), extract(), start_async_read()
+	and end_async_read()."""
 	def __init__(self, fnames, reuse="full"):
 		self.fnames = fnames
+		# These provide timing data. The timing information clutters up
+		# this class quite a bit, but it was useful when debugging
+		# performance
+		self._timer = Timer(["getsize","alloc","start","finish","scan","extract","free"])
+		self._cum_timer = Timer(self._timer.names)
 		# Set up our allocators
 		if reuse not in ["full","partial","none"]:
 			raise ValuError("Unknown buffer reuse strategy '%s'" % str(reuse))
@@ -146,8 +226,10 @@ class G3MultiFile:
 		self.falloc  = fatype("fields")
 		# First file doesn't benefit from async, but easiest to do it
 		# this way anyway in light of the allocator
-		with async_read(fnames[0], allocator=self.ballocs[0]) as buf: pass
-		self.g3file = G3File(fnames[0], buf)
+		with async_read(fnames[0], allocator=self.ballocs[0]) as reader: pass
+		tadd(self.times, reader.times)
+		self.g3file = G3File(fnames[0], reader.buf)
+		tadd(self.times, self.g3file.times, ["scan"])
 		# This meta is only representative of the first file
 		self._meta  = self.g3file._meta
 		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
@@ -159,26 +241,49 @@ class G3MultiFile:
 	def read(self):
 		for fi in range(self.nfile-1):
 			# Start the next read while we work
-			with async_read(self.fnames[fi+1], allocator=self.ballocs[1]) as buf:
+			with async_read(self.fnames[fi+1], allocator=self.ballocs[1]) as reader:
 				for field_name, val in self._queue.items():
 					self.g3file.queue(field_name, **val, allocator=self.falloc)
-				yield self.g3file.read()
+				fields = self.g3file.read(allocator=self.falloc)
+				tadd(self.times, self.g3file.times, ["alloc","extract"])
+				tadd(self.times, reader.times, ["getsize","alloc","start"])
+				tadd(self.cum_times, self.times)
+				yield fields
+				self._timer.reset()
+				with self._timer("free"): del fields
+			tadd(self.times, reader.times, ["finish"])
 			# Use newly read bytes to set up new file
-			self.g3file = G3File(self.fnames[fi+1], buf)
+			self.g3file = G3File(self.fnames[fi+1], reader.buf)
+			tadd(self.times, self.g3file.times, ["scan"])
 			# Invalidate memory we're done with.
-			self.falloc.reset()
-			self.ballocs[0].reset()
+			with self._timer("free"):
+				self.falloc.reset()
+				self.ballocs[0].reset()
 			# Swap file buffer allocators, so we overwrite the oldest
 			# buffer next time
 			self.ballocs = self.ballocs[::-1]
 		# Last file doesn't have a next one to start
 		for field_name, val in self._queue.items():
-			self.g3file.queue(field_name, **val, allocator=self.falloc[1])
-		yield self.g3file.read()
+			self.g3file.queue(field_name, **val, allocator=self.falloc)
+		fields = self.g3file.read(allocator=self.falloc)
+		tadd(self.times, self.g3file.times, ["alloc","extract"])
+		tadd(self.cum_times, self.times)
+		yield fields
+		self._timer.reset()
 		# Reset the last buffers
-		self.falloc.reset()
-		self.ballocs[0].reset()
-		self._queue = {}
+		with self._timer("free"):
+			del fields
+			self.falloc.reset()
+			self.ballocs[0].reset()
+			self._queue = {}
+		tadd(self.cum_times, self.times)
+	def __enter__(self): return self
+	def __exit__(self, type, value, traceback):
+		# Clean up memory. The buffer contains the whole raw file
+		# read into memory
+		self.g3file = None
+		self.ballocs= None
+		self.falloc = None
 	# We do not support read_field here, as it would
 	# be too inefficient
 	def __repr__(self):
@@ -192,6 +297,10 @@ class G3MultiFile:
 			msg += " %-*s: %s,\n" % (nchar, "'"+fieldname+"'", str(fdesc))
 		msg += "}"
 		return msg
+	@property
+	def times(self): return self._timer.data
+	@property
+	def cum_times(self): return self._cum_timer.data
 
 class MultiField:
 	def __init__(self, shape, dtype, names):
@@ -214,6 +323,7 @@ def format_names(names, maxlen):
 
 # Alias to make it more like python's open()
 open_g3    = G3File
+open_multi = G3MultiFile
 
 ############################
 # Manual memory management #
@@ -288,3 +398,28 @@ class DummyAlloc:
 	def array(self, arr): return np.array(arr)
 	def reset(self): pass
 	def __repr__(self): return "DummyAlloc(name='%s')" % (self.name)
+
+class Timer:
+	def __init__(self, names):
+		self.names = names
+		self.reset()
+	@contextmanager
+	def __call__(self, name):
+		d  = self.data[name]
+		t1 = time.time()
+		try:
+			yield
+		finally:
+			t2 = time.time()
+			d[0] += t2-t1
+			d[1] += 1
+	def reset(self):
+		self.data = {name:[0,0] for name in self.names}
+
+def tadd(a, b, names=None):
+	if names is None: names = b.keys()
+	for name in names:
+		da = a[name]
+		db = b[name]
+		for i in range(2):
+			da[i] += db[i]

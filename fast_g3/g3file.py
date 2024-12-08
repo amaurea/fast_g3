@@ -160,12 +160,24 @@ class G3MultiFile:
 		yield self.g3file.read()
 	# We do not support read_field here, as it would
 	# be too inefficient
+	def __repr__(self):
+		fieldnames = sorted(self.fields.keys())
+		nchar      = max([len(fn) for fn in fieldnames])+2
+		msg = "G3MultiFile([\n"
+		for fname in self.fnames:
+			msg += " %s,\n" % fname
+		msg += "], fields={\n"
+		for fieldname, fdesc in self.fields.items():
+			msg += " %-*s: %s,\n" % (nchar, "'"+fieldname+"'", str(fdesc))
+		msg += "}"
+		return msg
 
 class MultiField:
 	def __init__(self, shape, dtype, names):
 		self.shape, self.dtype, self.names = shape, dtype, names
 	def __repr__(self):
-		shape_str = str(self.shape) if len(self.shape) == 1 else "(%d,?)" % shape[-1]
+		if len(self.shape) == 1: shape_str = "(?,)"
+		else: shape_str = "(%d,?)" % self.shape[-2]
 		return "Field(shape=%s,dtype=%s,names:%s)" % (shape_str, str(self.dtype), format_names(self.names,35))
 
 def rowshape(shape, dets):

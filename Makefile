@@ -7,6 +7,6 @@ build: build/build.ninja
 build/build.ninja: Makefile meson.build
 	rm -rf build
 	mkdir build
-	meson setup build --buildtype=debug
+	meson setup build --buildtype=release
 clean:
 	rm -rf build

@@ -1,6 +1,6 @@
-from .fast_g3_core import scan, extract
+from .fast_g3_core import scan, extract, start_async_read, end_async_read
 from contextlib import contextmanager
-import numpy as np
+import numpy as np, os
 
 class G3File:
 	"""G3File: High-level interface for fast_g3.
@@ -26,14 +26,16 @@ class G3File:
 	open_g3 is an alias for G3File.
 
 	Built on the low-level interface scan() and extract()."""
-	def __init__(self, fname):
+	def __init__(self, fname, buffer=None):
 		"""Initialize the G3File by reading the whole file into
 		memory and performing a quick scan through the data to
 		determine which fields are persent. This can be memory-
 		heavy, but is needed for performance reasons."""
 		self.fname  = fname
-		with open(self.fname, "rb") as ifile:
-			self._buffer = ifile.read()
+		if buffer is None:
+			with open(self.fname, "rb") as ifile:
+				self._buffer = ifile.read()
+		else: self._buffer = buffer
 		self._meta  = scan(self._buffer)
 		self.fields = {key:Field(**val,owner=self,field_name=key) for key,val in self._meta["fields"].items()}
 		self._queue = {}
@@ -119,6 +121,52 @@ class Field:
 		return self.owner.read_field(self.field_name, rows=rows, oarr=oarr)
 	def __repr__(self):
 		return "Field(shape=%s,dtype=%s,names:%s)" % (str(self.shape), str(self.dtype), format_names(self.names,35))
+
+@contextmanager
+def async_read(fname):
+	size = os.path.getsize(fname)
+	buf  = bytes(size)
+	task = start_async_read(fname, buf)
+	try:
+		yield buf
+	finally:
+		end_async_read(task)
+
+class G3MultiFile:
+	def __init__(self, fnames):
+		self.fnames = fnames
+		# No async for the first file
+		self.g3file = G3File(fnames[0])
+		# This meta is only representative of the first file
+		self._meta  = self.g3file._meta
+		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
+		self._queue = {}
+	@property
+	def nfile(self): return len(self.fnames)
+	def queue(self, field_name, rows=None):
+		self._queue[field_name] = {"rows":rows}
+	def read(self):
+		for fi in range(self.nfile-1):
+			# Start the next read while we work
+			with async_read(self.fnames[fi+1]) as buf:
+				for field_name, val in self._queue.items():
+					self.g3file.queue(field_name, **val)
+				yield self.g3file.read()
+			# Use newly read bytes to set up new file
+			self.g3file = G3File(self.fnames[fi+1], buf)
+		# Last file doesn't have a next one to start
+		for field_name, val in self._queue.items():
+			self.g3file.queue(field_name, **val)
+		yield self.g3file.read()
+	# We do not support read_field here, as it would
+	# be too inefficient
+
+class MultiField:
+	def __init__(self, shape, dtype, names):
+		self.shape, self.dtype, self.names = shape, dtype, names
+	def __repr__(self):
+		shape_str = str(self.shape) if len(self.shape) == 1 else "(%d,?)" % shape[-1]
+		return "Field(shape=%s,dtype=%s,names:%s)" % (shape_str, str(self.dtype), format_names(self.names,35))
 
 def rowshape(shape, dets):
 	"""Return the correct shape of a field output array

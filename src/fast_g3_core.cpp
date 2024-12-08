@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <FLAC/stream_decoder.h>
 #include <bzlib.h>
+#include <aio.h>
+#include <memory>
 
 #if NPY_ABI_VERSION < 0x02000000
   #define PyDataType_ELSIZE(descr) ((descr)->elsize)
@@ -45,6 +47,29 @@ struct ScanInfo {
 };
 struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte; double quantum; int npy_type, itemsize; uint8_t algo; };
 typedef vector<Work> WorkList;
+// Used for async reads
+struct AioTask {
+	AioTask(FILE * file=NULL, aiocb * ao=NULL):file(file),ao(ao) {}
+	~AioTask() { if(file) fclose(file); if(ao) delete ao; }
+	FILE * file; aiocb * ao;
+};
+
+// printf that returns a new string
+string fmt(const char * format, ...) {
+	// First figure out how big the string needs to be
+	va_list ap;
+	size_t size = 0;
+	va_start(ap, format);
+	int n = vsnprintf(NULL, size, format, ap);
+	va_end(ap);
+	// Make a big enough string
+	string msg(n, '\0');
+	// And fill it
+	va_start(ap, format);
+	vsnprintf(msg.data(), n, format, ap);
+	va_end(ap);
+	return msg;
+}
 
 // Used to ensure python resources are freed.
 // Set ptr to NULL if you change your mind
@@ -414,6 +439,36 @@ void read_worklist(const WorkList & worklist) {
 		read_work(worklist[wi]);
 }
 
+// Asynchronous read stuff
+std::shared_ptr<AioTask> start_async_read(const char * fname, char * obuf, ssize_t obytes) {
+	std::shared_ptr<AioTask> task = std::make_shared<AioTask>();
+	// Open file for reading
+	task->file = fopen(fname, "rb");
+	if(!task->file) throw std::runtime_error(fmt("Error opening file '%s'", fname));
+	// Set up task
+	aiocb * ao = new aiocb();
+	ao->aio_fildes = fileno(task->file);
+	ao->aio_offset = 0;
+	ao->aio_buf    = obuf;
+	ao->aio_nbytes = obytes;
+	task->ao = ao;
+	// Start reading
+	int status = aio_read(task->ao);
+	if(status)
+		throw std::runtime_error(fmt("Error %d in aio_read for '%s'", status, fname));
+	return task;
+}
+
+int end_async_read(AioTask & task) {
+	int status = aio_suspend(&task.ao, 1, NULL);
+	// Regardless of status we should close the resources
+	fclose(task.file);
+	delete task.ao;
+	task.file = NULL;
+	task.ao   = NULL;
+	return status;
+}
+
 extern "C" {
 
 static PyObject * scan_py(PyObject * self, PyObject * args) {
@@ -563,6 +618,47 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	Py_RETURN_NONE;
 }
 
+static PyObject * start_async_read_py(PyObject * self, PyObject * args) {
+	const char * fname;
+	char * obuf;
+	ssize_t obytes;
+	if(!PyArg_ParseTuple(args, "sy#", &fname, &obuf, &obytes)) return NULL;
+	std::shared_ptr<AioTask> task;
+	try { task = start_async_read(fname, obuf, obytes); }
+	catch(const std::runtime_error & e) {
+		PyErr_SetString(PyExc_IOError, e.what());
+		return NULL;
+	}
+	// Return FILE* and ao* as tuple members
+	PyObject * ret    = PyTuple_New(2);
+	PyHandle delete_ret = ret;
+	PyObject * pyfile = PyLong_FromVoidPtr(task->file); if(!pyfile) return NULL;
+	PyTuple_SET_ITEM(ret, 0, pyfile);
+	PyObject * pyao   = PyLong_FromVoidPtr(task->ao);   if(!pyao)   return NULL;
+	PyTuple_SET_ITEM(ret, 1, pyao);
+	// Now that python know about the file and ao, stop shared_ptr from
+	// deleting them when it goes out of scope
+	task->file = NULL;
+	task->ao   = NULL;
+	delete_ret.ptr = NULL;
+	return ret;
+}
+
+static PyObject * end_async_read_py(PyObject * self, PyObject * args) {
+	PyObject * info;
+	if(!PyArg_ParseTuple(args, "O", &info)) return NULL;
+	PyObject * pyfile = PyTuple_GetItem(info, 0); if(!pyfile) return NULL;
+	PyObject * pyao   = PyTuple_GetItem(info, 1); if(!pyao)   return NULL;
+	FILE  * file = (FILE *)PyLong_AsVoidPtr(pyfile); if(PyErr_Occurred()) return NULL;
+	aiocb * ao   = (aiocb*)PyLong_AsVoidPtr(pyao);   if(PyErr_Occurred()) return NULL;
+	AioTask task(file, ao);
+	int status = end_async_read(task);
+	if(status) {
+		PyErr_SetString(PyExc_IOError, fmt("Async read error %d", status).c_str());
+		return NULL;
+	}
+	return Py_None;
+}
 
 PyDoc_STRVAR(scan__doc,
 	"scan(buffer)\n--\n"
@@ -583,9 +679,27 @@ PyDoc_STRVAR(read__doc,
 	"of the output array must reflect the number of rows requested\n"
 );
 
+PyDoc_STRVAR(start_async_read__doc,
+	"start_async_read(fname, buffer)\n--\n"
+	"\n"
+	"Start an asynchronous read of the named file into the given\n"
+	"buffer, which must be a bytes object with the correct length\n"
+	"Returns an async task object that must be passed to\n"
+	"end_async_read() to free up resources.\n"
+);
+
+PyDoc_STRVAR(end_async_read__doc,
+	"end_async_read(async_task)\n--\n"
+	"\n"
+	"Wait for an asynchronous read started with start_async_read\n"
+	"to finish, and free up resources when it does\n"
+);
+
 static PyMethodDef methods[] = {
 	{"scan", scan_py, METH_VARARGS, scan__doc},
 	{"extract", (PyCFunction)extract_py, METH_VARARGS|METH_KEYWORDS, read__doc},
+	{"start_async_read", start_async_read_py, METH_VARARGS, start_async_read__doc},
+	{"end_async_read", end_async_read_py, METH_VARARGS, end_async_read__doc},
 	{NULL, NULL, 0, NULL}
 };
 

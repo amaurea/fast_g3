@@ -34,16 +34,32 @@
 //   for the specified fields. The interface works like this
 //   to all the reads to happen as much in parallel as possible.
 
+// We also need the scalars from the individual frames. We don't know
+// what these do or how they would combine in general, so we can just
+// return them as a list of frames, each of which has a type and list
+// of key,value pairs, excluding the fields we already handled.
+// It probably makes the most sense to include this as part of meta.
+//
+// Add a member Frame[] frames to ScanInfo,
+// where Frame = { int32_t type; Entry[] entries; } and
+// Entry = { string name; int64_t buf0, nbyte; enum etype; };
+// This would then be translated to Python objects later.
+
 using std::string;
 using std::vector;
-struct Segment  { int64_t row, samp0, nsamp, buf0, nbyte; double quantum; uint8_t algo; };
+enum class FType { None, G3Int, G3Double, G3String, G3Time, G3VectorInt8, G3VectorInt16, G3VectorInt32, G3VectorInt64, G3VectorDouble, G3VectorBool, G3TimesampleMap, G3SuperTimestream };
+struct Segment     { int64_t row, samp0, nsamp, buf0, nbyte; double quantum; uint8_t algo; };
+struct SimpleField { int64_t buf0, nbyte; string name; FType type; };
 typedef vector<Segment> Segments;
 typedef vector<string> Names;
 struct Field    { int npy_type, ndim; Names names; Segments segments; };
+typedef vector<SimpleField> SimpleFields;
+struct Frame    { int32_t type; SimpleFields simple_fields; };
+typedef vector<Frame> Frames;
 typedef std::unordered_map<string,Field> Fields;
 struct ScanInfo {
 	ScanInfo():nsamp(0),curnsamp(0) {}
-	int64_t nsamp, curnsamp; Fields fields;
+	int64_t nsamp, curnsamp; Fields fields; Frames frames;
 };
 struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte; double quantum; int npy_type, itemsize; uint8_t algo; };
 typedef vector<Work> WorkList;
@@ -73,6 +89,8 @@ string fmt(const char * format, ...) {
 
 // Used to ensure python resources are freed.
 // Set ptr to NULL if you change your mind
+// This class should have just used reference counting
+// itself, with a copy constructor. Oh well.
 struct PyHandle {
 	// This is a bit heavy-handed. We only need it for the Python object types
 	PyHandle():ptr(NULL) {}
@@ -82,6 +100,7 @@ struct PyHandle {
 	operator bool()      { return ptr != NULL; }
 	PyHandle & inc() { Py_XINCREF(ptr); return *this; }
 	PyHandle & dec() { Py_XDECREF(ptr); return *this; }
+	PyObject * defuse() { PyObject * ret = ptr; ptr = NULL; return ret; }
 	PyObject * ptr;
 };
 
@@ -294,7 +313,7 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	buf.pos += signal_nbyte_comp;
 }
 
-void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo) {
+void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo, Frame & frame) {
 	for(int fi = 0; fi < nfield; fi++) {
 		int64_t field_name_len = buf.read<int64_t>();
 		string field_name       = buf.read_string(field_name_len);
@@ -304,14 +323,46 @@ void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo) {
 		subbuf.pos += 5;
 		int64_t type_name_len  = subbuf.read<int64_t>();
 		string type_name        = subbuf.read_string(type_name_len);
+		FType ftype = FType::None;
+		int64_t nbyte;
+		// First the cases we handle specially. These have samples as
+		// their last axis, and will be concatenated into big arrays.
 		if(type_name == "G3TimesampleMap") {
 			subbuf.pos += 16;
 			int32_t subfields = subbuf.read<int32_t>();
 			process_timesamplemap(subbuf, subfields, field_name + "/", sinfo);
 		} else if(type_name == "G3SuperTimestream") {
 			process_supertimestream(subbuf, field_name, sinfo);
+		} else {
+			// Remaning field types here
+			subbuf.pos += 12;
+			if     (type_name == "G3Int")   { ftype = FType::G3Int;    nbyte = 8; }
+			else if(type_name == "G3Time")  { ftype = FType::G3Time;   nbyte = 8; }
+			else if(type_name == "G3Double"){ ftype = FType::G3Double; nbyte = 8; }
+			else if(type_name == "G3String"){ ftype = FType::G3String; nbyte = subbuf.read<int64_t>(); }
+			else if(type_name == "G3VectorDouble") { ftype = FType::G3VectorDouble; nbyte = subbuf.read<int64_t>()*8; }
+			else if(type_name == "G3VectorInt") {
+				int32_t itemsize = subbuf.read<int32_t>()/8;
+				nbyte = subbuf.read<int64_t>()*itemsize;
+				if     (itemsize == 1) ftype = FType::G3VectorInt8;
+				else if(itemsize == 2) ftype = FType::G3VectorInt16;
+				else if(itemsize == 4) ftype = FType::G3VectorInt32;
+				else if(itemsize == 8) ftype = FType::G3VectorInt64;
+				else {
+					// Invalid field. Ignore for now
+				}
+			}
+			else if(type_name == "G3VectorBool") { ftype = FType::G3VectorBool; nbyte = subbuf.read<int64_t>()*1; }
+			else {
+				// Unknown type. Just ignore for now
+			}
 		}
 		buf.pos += val_len;
+		// Append non-sample fields to frame
+		if(ftype != FType::None) {
+			SimpleField simple_field = { subbuf.pos, nbyte, field_name, ftype };
+			frame.simple_fields.push_back(simple_field);
+		}
 	}
 }
 
@@ -319,11 +370,13 @@ ScanInfo scan(Buffer & buf) {
 	ScanInfo sinfo;
 	// Loop over frames in file
 	for(int framei = 0; buf.pos < buf.size; framei++) {
+		Frame frame; // holds all frame data we don't extract into Fields
 		uint8_t foo1    = buf.read<uint8_t>(); (void)foo1;
 		int32_t version = buf.read<int32_t>(); (void)version;
 		int32_t nfield  = buf.read<int32_t>(); (void)nfield;
-		int32_t type    = buf.read<int32_t>(); (void)type;
-		process_fields(buf, nfield, sinfo);
+		frame.type      = buf.read<int32_t>();
+		process_fields(buf, nfield, sinfo, frame);
+		sinfo.frames.push_back(frame);
 		sinfo.nsamp += sinfo.curnsamp;
 		int32_t crc     = buf.read<int32_t>(); (void)crc;
 	}
@@ -469,6 +522,91 @@ int end_async_read(AioTask & task) {
 	return status;
 }
 
+const char * get_frame_type_name(int32_t code) {
+	switch(code) {
+		case 'T': return "timepoint";
+		case 'H': return "housekeeping";
+		case 'O': return "observation";
+		case 'S': return "scan";
+		case 'M': return "map";
+		case 'I': return "instrumentationstatus";
+		case 'W': return "wiring";
+		case 'C': return "calibration";
+		case 'G': return "gcpslow";
+		case 'P': return "pipelineinfo";
+		case 'E': return "ephemeris";
+		case 'L': return "lightcurve";
+		case 'R': return "statistics";
+		case 'Z': return "endprocessing";
+		case 'N': return "none";
+		default: return "unknown";
+	}
+}
+
+PyObject * array_copy_from_bytes(npy_intp nitem, int typenum, const void * ptr, int64_t nbyte) {
+	return PyArray_New(&PyArray_Type, 1, &nitem, typenum, NULL, (void*)ptr, 0, NPY_ARRAY_ENSURECOPY, NULL);
+	//PyObject * arr = PyArray_EMPTY(1, &nitem, typenum, 0); if(!arr) return NULL;
+	//memcpy(PyArray_GETPTR1((PyArrayObject*)arr,0), ptr, nbyte);
+	//return arr;
+}
+
+// Expand sinfo.frames into python objects
+PyObject * expand_simple(const Frames & frames, Buffer buf) {
+	PyHandle pframes = PyList_New(frames.size()); if(!pframes) return NULL;
+	for(size_t fi = 0; fi < frames.size(); fi++) {
+		const Frame & frame = frames[fi];
+		// Make dict to hold entries in this frame. Stolen when added
+		PyObject * pframe = PyDict_New(); if(!pframe) return NULL;
+		PyList_SET_ITEM(pframes, fi, pframe);
+		PyHandle pcode = PyLong_FromLong(frame.type); if(!pcode) return NULL;
+		PyHandle pname = PyUnicode_FromString(get_frame_type_name(frame.type)); if(!pname) return NULL;
+		PyDict_SetItemString(pframe, "code", pcode); if(PyErr_Occurred()) return NULL;
+		PyDict_SetItemString(pframe, "type", pname); if(PyErr_Occurred()) return NULL;
+		// Set up the field info, which will be a subdict
+		PyHandle pfields = PyDict_New(); if(!pfields) return NULL;
+		PyDict_SetItemString(pframe, "fields", pfields); if(PyErr_Occurred()) return NULL;
+		for (const SimpleField & field : frame.simple_fields) {
+			PyHandle fname = PyUnicode_FromString(field.name.c_str()); if(!fname) return NULL;
+			// Ok, time to handle the different types!
+			const char * vptr = &buf.data[field.buf0];
+			PyHandle value;
+			switch(field.type) {
+				case FType::G3Int:
+				case FType::G3Time:
+					value.ptr = PyLong_FromLong(*(int64_t*)vptr); break;
+				case FType::G3Double:
+					value.ptr = PyFloat_FromDouble(*(double*)vptr); break;
+				case FType::G3String:
+					value.ptr = PyUnicode_FromStringAndSize(vptr, field.nbyte); break;
+				case FType::G3VectorInt8:
+					value.ptr = array_copy_from_bytes(field.nbyte, NPY_INT8, vptr, field.nbyte);
+					break;
+				case FType::G3VectorInt16:
+					value.ptr = array_copy_from_bytes(field.nbyte/2, NPY_INT16, vptr, field.nbyte);
+					break;
+				case FType::G3VectorInt32:
+					value.ptr = array_copy_from_bytes(field.nbyte/4, NPY_INT32, vptr, field.nbyte);
+					break;
+				case FType::G3VectorInt64:
+					value.ptr = array_copy_from_bytes(field.nbyte/8, NPY_INT64, vptr, field.nbyte);
+					break;
+				case FType::G3VectorDouble:
+					value.ptr = array_copy_from_bytes(field.nbyte/8, NPY_FLOAT64, vptr, field.nbyte);
+					break;
+				case FType::G3VectorBool:
+					value.ptr = array_copy_from_bytes(field.nbyte, NPY_BOOL, vptr, field.nbyte);
+					break;
+				default:
+					// Skip unknown
+					continue;
+			}
+			if(!value) return NULL;
+			PyDict_SetItem(pfields, fname, value); if(PyErr_Occurred()) return NULL;
+		}
+	}
+	return pframes.defuse();
+}
+
 extern "C" {
 
 static PyObject * scan_py(PyObject * self, PyObject * args) {
@@ -483,7 +621,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 		return NULL;
 	}
 	// Convert to python types
-	PyObject * meta = PyDict_New(); PyHandle delete_meta(meta);
+	PyHandle meta = PyDict_New();
 	PyHandle nsamp = PyLong_FromUnsignedLong(sinfo.nsamp);if(!nsamp)return NULL;
 	PyDict_SetItemString(meta, "nsamp", nsamp);
 	// Set up the fields
@@ -529,9 +667,11 @@ static PyObject * scan_py(PyObject * self, PyObject * args) {
 		PyDict_SetItemString(fields, name.c_str(), pyfield);
 	}
 	PyDict_SetItemString(meta, "fields", fields);
-	// Looks like everything is done. Return our result after cancelling the meta cleanup
-	delete_meta.ptr = NULL;
-	return meta;
+	// Add the simple fields from the frames too
+	PyHandle frames = expand_simple(sinfo.frames, buf); if(!frames) return NULL;
+	PyDict_SetItemString(meta, "frames", frames);
+	// Everything looks ok
+	return meta.defuse();
 }
 
 

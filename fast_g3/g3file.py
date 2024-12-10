@@ -90,6 +90,9 @@ class G3File:
 			extract(self._buffer, self._meta, self._queue)
 		# Format output
 		result = {name:request["oarr"] for name,request in self._queue.items()}
+		# Add frames to result. This would cause a collision if one of our
+		# main fields has a name "frames", but this is unlikely
+		result["frames"] = self._meta["frames"]
 		self._queue = {}
 		return result
 	def __repr__(self):
@@ -105,6 +108,8 @@ class G3File:
 		# Clean up memory. The buffer contains the whole raw file
 		# read into memory
 		self._buffer = None
+	@property
+	def frames(self): return self._meta["frames"]
 	@property
 	def times(self): return self._timer.data
 	def _prepare_request(self, field_name, rows=None, oarr=None, allocator=None):

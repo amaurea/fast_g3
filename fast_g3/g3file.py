@@ -8,8 +8,11 @@ class G3File:
 	Example usage:
 
 	with G3File("file.g3") as f:
-		# Print the fields in the file
+		# Print the main fields in the file
 		print(f.fields)
+		# Print the misc fields in the file. These are not
+		# merged across frames, so they are presented per-frame
+		print(f.frames)
 		# Read a single field
 		times = f.read_field("signal/times")
 		# Read a single field, but only some rows
@@ -79,7 +82,8 @@ class G3File:
 		"""Read all the queued-up fields in parallel, or every field if
 		queue() was not used.
 
-		Returns a dictionary of {field_name:field_data}.
+		Returns a dictionary of {field_name:field_data}. The misc fields
+		are also included in this dictionary under the key "frames".
 		Empties the queue."""
 		# If we don't have a queue, then read everything
 		if len(self._queue) == 0:

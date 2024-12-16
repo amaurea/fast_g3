@@ -557,7 +557,7 @@ PyObject * expand_simple(const Frames & frames, Buffer buf) {
 		const Frame & frame = frames[fi];
 		// Make dict to hold entries in this frame. Stolen when added
 		PyObject * pframe = PyDict_New(); if(!pframe) return NULL;
-		PyList_SET_ITEM(pframes, fi, pframe);
+		PyList_SET_ITEM(pframes.ptr, fi, pframe);
 		PyHandle pcode = PyLong_FromLong(frame.type); if(!pcode) return NULL;
 		PyHandle pname = PyUnicode_FromString(get_frame_type_name(frame.type)); if(!pname) return NULL;
 		PyDict_SetItemString(pframe, "code", pcode); if(PyErr_Occurred()) return NULL;

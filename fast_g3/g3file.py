@@ -123,6 +123,8 @@ class G3File:
 		if allocator is None: allocator = np
 		with self._timer("alloc"):
 			if oarr is None: oarr = allocator.empty(shape, info.dtype)
+		# rows is small, so just convert it if it has the wrong type
+		if rows is not None: rows = np.asarray(rows, dtype=np.int32)
 		# Check that everything makes sense
 		if oarr.shape != shape or oarr.dtype != info.dtype or oarr.strides[-1] != oarr.itemsize:
 			raise ValueError("Field %s output array must have shape %s dtype %s and be contiguous along the last axis" % (name, str(shape), str(info.dtype)))
@@ -246,6 +248,7 @@ class G3MultiFile:
 	@property
 	def nfile(self): return len(self.fnames)
 	def queue(self, field_name, rows=None):
+		if rows is not None: rows = np.asarray(rows, dtype=np.int32)
 		self._queue[field_name] = {"rows":rows}
 	def read(self):
 		for fi in range(self.nfile-1):

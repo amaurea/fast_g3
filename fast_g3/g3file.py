@@ -39,13 +39,16 @@ class G3File:
 		self._reader = AsyncReader(fname, allocator=allocator)
 		self._queue  = {}
 		self._reader.start()
+		self.finished= False
 		if not async_init: self.finish()
 	def finish(self):
+		if self.finished: return
 		self._reader.finish()
 		with self._timer("scan"):
 			self._meta  = scan(self._reader.buf)
 		self.fields = {key:Field(**val,owner=self,field_name=key) for key,val in self._meta["fields"].items()}
 		tadd(self.times, self._reader.times)
+		self.finished = True
 	@property
 	def nsamp(self): return self._meta["nsamp"]
 	def read_field(self, field_name, rows=None, oarr=None, allocator=None):
@@ -190,7 +193,7 @@ class G3MultiFile:
 		# Select some fields for reading. Same syntax as G3File
 		f.queue("signal/time")
 		f.queue("signal/data", rows=[0,10,20,30])
-		f.queue("ancil/az_end")
+		f.queue("ancil/az_enc")
 		# Process the data for all the files
 		for filedata in f.read():
 			do_something_with_filedata()
@@ -246,8 +249,10 @@ class G3MultiFile:
 		self.g3file = G3File(fnames[0], allocator=self.alloc.ballocs[1], async_init=True)
 		# Allow interleaved read chaining
 		self._next_read_callback = _next_read_callback or (lambda: None)
+		self.finished = False
 		if not async_init: self.finish()
 	def finish(self):
+		if self.finished: return
 		self.g3file.finish()
 		self.alloc.swap()
 		tadd(self.times, self.g3file.times)
@@ -255,6 +260,7 @@ class G3MultiFile:
 		self._meta  = self.g3file._meta
 		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
 		self._queue = {}
+		self.finished = True
 	@property
 	def nfile(self): return len(self.fnames)
 	def queue(self, field_name, rows=None):
@@ -267,7 +273,7 @@ class G3MultiFile:
 			# Process current file
 			for field_name, val in self._queue.items():
 				self.g3file.queue(field_name, **val, allocator=self.falloc)
-			fields = self.g3file.read(allocator=self.falloc)
+			fields = self.g3file.read(allocator=self.alloc.falloc)
 			tadd(self.times, self.g3file.times, ["alloc","extract"])
 			tadd(self.times, next_g3file.times, ["getsize","alloc","start"])
 			tadd(self.cum_times, self.times)
@@ -280,7 +286,7 @@ class G3MultiFile:
 			tadd(self.times, self.g3file.times, ["finish","scan"])
 			# Invalidate memory we're done with.
 			with self._timer("free"):
-				self.falloc.reset()
+				self.alloc.falloc.reset()
 				self.alloc.ballocs[0].reset()
 			# Swap file buffer allocators, so we overwrite the oldest
 			# buffer next time
@@ -327,16 +333,45 @@ class G3MultiFile:
 	@property
 	def cum_times(self): return self._cum_timer.data
 
+# Consider replacing the long list of lists interface to
+# G3MultiMuliFile with a minimal constructor, and then
+# a function (queue?) to register each list of files.
+# This would generalize well for sample range support,
+# and would also fit nicely with how G3MultiFile works
+
 class G3MultiMultiFile:
 	"""Class for chaining reads of multiple G3MultiFiles together.
 	This is useful to allow buffer reuse between them, and to allow
 	interleaving the extraction of the last file in one with the
-	reading of the first file in the next"""
-	def __init__(self, fname_lists, reuse="full", alloc=None):
-		self.alloc       = allocs or G3MultiAlloc(reuse=reuse)
-		self.fname_lists = list(fname_lists)
+	reading of the first file in the next.
+
+	Example usage:
+
+	with G3MultiMultiFile() as mmfile:
+		# queue up the file lists to iterate over
+		mmfile.queue([wafer2file1,wafer2file2,...])
+		mmfile.queue([wafer2file1,wafer2file2,...])
+		...
+		for f in mmfile:
+			# f is a single G3MultiFile that we can work with normally. For example
+			dets = f.fields["signal/data"].names
+			rows = find(dets, list_of_detectors_we_want)
+			f.queue("signal/times")
+			f.queue("signal/data", rows=rows)
+			f.queue("ancil/az_enc")
+			# Read data for each file in this multifile
+			for filedata in f.read():
+				do_something_with_filedata()
+	"""
+	def __init__(self, reuse="full", alloc=None):
+		self.alloc       = alloc or G3MultiAlloc(reuse=reuse)
+		self.fname_lists = []
 		self._timer = Timer(["getsize","alloc","start","finish","scan","extract","free"])
 		self._cum_timer = Timer(self._timer.names)
+	def queue(self, fnames):
+		"""Queue up a list of file names. When iterating over a G3MultiMultiFile,
+		one G3MultiFile will be yielded for each list of fnames queued up this way."""
+		self.fname_lists.append(fnames)
 	@property
 	def nlist(self): return len(self.fname_lists)
 	def __enter__(self): return self
@@ -346,11 +381,11 @@ class G3MultiMultiFile:
 		self.alloc      = None
 	def __iter__(self):
 		if len(self.fname_lists) == 0: return
-		self.mfile      = None
+		# Handle the first file
+		self.mfile = G3MultiFile(self.fname_lists[0], alloc=self.alloc)
 		self.next_mfile = None
-		# Make it easier to handle start and end of loop
-		work_list   = self.fname_lists+[None]
-		for fi in range(-1,self.nlist):
+		for fi in range(self.nlist):
+			# If we still have more files left after the current, prepare fot it
 			if fi < self.nlist-1:
 				next_fnames = self.fname_lists[fi+1]
 				def start_next():
@@ -359,22 +394,21 @@ class G3MultiMultiFile:
 					# self.alloc.ballocs[1], which has just become available
 					self.next_mfile = G3MultiFile(next_fnames, alloc=self.alloc, async_init=True)
 				self.mfile._next_read_callback = start_next
-			# ok, process the current file, if we have one yet
-			if self.mfile:
-				# Yield the mfile to the caller. We will regain control
-				# when reader is finished with all files in this mfile.
-				# At this point self.alloc.balloc[0] and self.alloc.falloc
-				# will be invalidated, in time for mfile.finish() below to
-				# use them.
-				yield self.mfile
-				self.times.reset()
-				tadd(self.times, self.mfile.times)
-				tadd(self.cum_times, self.times)
+			# Yield the mfile to the caller. We will regain control
+			# when reader is finished with all files in this mfile.
+			# At this point self.alloc.balloc[0] and self.alloc.falloc
+			# will be invalidated, in time for mfile.finish() below to
+			# use them.
+			yield self.mfile
+			self._timer.reset()
+			tadd(self.times, self.mfile.cum_times)
+			tadd(self.cum_times, self.times)
 			# Wait for next file to be ready
 			if self.next_mfile:
 				self.mfile      = self.next_mfile
 				self.mfile.finish()
 				self.next_mfile = None
+		self.queue = []
 	def __repr__(self):
 		return "G3MultiMultiFile(%s)" % str(self.fname_lists)
 	@property

@@ -29,22 +29,23 @@ class G3File:
 	open_g3 is an alias for G3File.
 
 	Built on the low-level interface scan() and extract()."""
-	def __init__(self, fname, buffer=None):
+	def __init__(self, fname, allocator=None, async_init=False):
 		"""Initialize the G3File by reading the whole file into
 		memory and performing a quick scan through the data to
 		determine which fields are persent. This can be memory-
 		heavy, but is needed for performance reasons."""
-		self.fname  = fname
-		self._timer = Timer(["read","alloc","scan","extract"])
-		if buffer is None:
-			with self._timer("read"):
-				with open(self.fname, "rb") as ifile:
-					self._buffer = ifile.read()
-		else: self._buffer = buffer
+		self.fname   = fname
+		self._timer  = Timer(["getsize","start","alloc","finish","scan","extract"])
+		self._reader = AsyncReader(fname, allocator=allocator)
+		self._queue  = {}
+		self._reader.start()
+		if not async_init: self.finish()
+	def finish(self):
+		self._reader.finish()
 		with self._timer("scan"):
-			self._meta  = scan(self._buffer)
+			self._meta  = scan(self._reader.buf)
 		self.fields = {key:Field(**val,owner=self,field_name=key) for key,val in self._meta["fields"].items()}
-		self._queue = {}
+		tadd(self.times, self._reader.times)
 	@property
 	def nsamp(self): return self._meta["nsamp"]
 	def read_field(self, field_name, rows=None, oarr=None, allocator=None):
@@ -63,7 +64,7 @@ class G3File:
 		Returns a numpy array with the values from the field."""
 		request = {field_name:self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)}
 		with self._timer("extract"):
-			extract(self._buffer, self._meta, request)
+			extract(self._reader.buf, self._meta, request)
 		return request[field_name]["oarr"]
 	def queue(self, field_name, rows=None, oarr=None, allocator=None):
 		"""Queue up a field to be read. All queued fields will
@@ -91,7 +92,7 @@ class G3File:
 				self.queue(name, allocator=allocator)
 		# Do the actual extraction
 		with self._timer("extract"):
-			extract(self._buffer, self._meta, self._queue)
+			extract(self._reader.buf, self._meta, self._queue)
 		# Format output
 		result = {name:request["oarr"] for name,request in self._queue.items()}
 		# Add frames to result. This would cause a collision if one of our
@@ -111,7 +112,7 @@ class G3File:
 	def __exit__(self, type, value, traceback):
 		# Clean up memory. The buffer contains the whole raw file
 		# read into memory
-		self._buffer = None
+		self._reader.buf = None
 	@property
 	def frames(self): return self._meta["frames"]
 	@property
@@ -206,6 +207,15 @@ class G3MultiFile:
 	  "full" is problematic for you. Medium speed.
 	* "none": Don't reuse any buffers. Slowest, with no advantages compared
 	  to "partial".
+	Alternatively a G3MultiAlloc can be passed in the alloc argument,
+	in which case reuse will be ignores.
+
+	If async_init is passed, then __init__ will be asynchronous, and class
+	initialization will not finish until .finish() is called. This does
+	not affect .read(), which will use asyncronous reads internally
+	in either case. The purpose of this argument is to be able to start
+	initialization of the next G3MultFile when the previous one when the
+	previous one is still extracting its last file.
 
 	Timing information can be accessed through .times and .cum_times, both
 	of which are dictionaries {name:[t,n]}, where name is one of
@@ -221,7 +231,8 @@ class G3MultiFile:
 
 	Built on the low-level interface scan(), extract(), start_async_read()
 	and end_async_read()."""
-	def __init__(self, fnames, reuse="full"):
+	def __init__(self, fnames, reuse="full", alloc=None, async_init=False,
+			_next_read_callback=None):
 		self.fnames = fnames
 		# These provide timing data. The timing information clutters up
 		# this class quite a bit, but it was useful when debugging
@@ -229,18 +240,17 @@ class G3MultiFile:
 		self._timer = Timer(["getsize","alloc","start","finish","scan","extract","free"])
 		self._cum_timer = Timer(self._timer.names)
 		# Set up our allocators
-		if reuse not in ["full","partial","none"]:
-			raise ValuError("Unknown buffer reuse strategy '%s'" % str(reuse))
-		batype = BufAlloc if reuse in ["full","partial"] else DummyAlloc
-		fatype = BufAlloc if reuse in ["full"] else DummyAlloc
-		self.ballocs = [batype("buf%d" % i) for i in range(2)]
-		self.falloc  = fatype("fields")
+		self.alloc = alloc or G3MultiAlloc(reuse=reuse)
 		# First file doesn't benefit from async, but easiest to do it
 		# this way anyway in light of the allocator
-		with async_read(fnames[0], allocator=self.ballocs[0]) as reader: pass
-		tadd(self.times, reader.times)
-		self.g3file = G3File(fnames[0], reader.buf)
-		tadd(self.times, self.g3file.times, ["scan"])
+		self.g3file = G3File(fnames[0], allocator=self.alloc.ballocs[1], async_init=True)
+		# Allow interleaved read chaining
+		self._next_read_callback = _next_read_callback or (lambda: None)
+		if not async_init: self.finish()
+	def finish(self):
+		self.g3file.finish()
+		self.alloc.swap()
+		tadd(self.times, self.g3file.times)
 		# This meta is only representative of the first file
 		self._meta  = self.g3file._meta
 		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
@@ -253,31 +263,35 @@ class G3MultiFile:
 	def read(self):
 		for fi in range(self.nfile-1):
 			# Start the next read while we work
-			with async_read(self.fnames[fi+1], allocator=self.ballocs[1]) as reader:
-				for field_name, val in self._queue.items():
-					self.g3file.queue(field_name, **val, allocator=self.falloc)
-				fields = self.g3file.read(allocator=self.falloc)
-				tadd(self.times, self.g3file.times, ["alloc","extract"])
-				tadd(self.times, reader.times, ["getsize","alloc","start"])
-				tadd(self.cum_times, self.times)
-				yield fields
-				self._timer.reset()
-				with self._timer("free"): del fields
-			tadd(self.times, reader.times, ["finish"])
-			# Use newly read bytes to set up new file
-			self.g3file = G3File(self.fnames[fi+1], reader.buf)
-			tadd(self.times, self.g3file.times, ["scan"])
+			next_g3file = G3File(self.fnames[fi+1], allocator=self.alloc.ballocs[1], async_init=True)
+			# Process current file
+			for field_name, val in self._queue.items():
+				self.g3file.queue(field_name, **val, allocator=self.falloc)
+			fields = self.g3file.read(allocator=self.falloc)
+			tadd(self.times, self.g3file.times, ["alloc","extract"])
+			tadd(self.times, next_g3file.times, ["getsize","alloc","start"])
+			tadd(self.cum_times, self.times)
+			yield fields
+			self._timer.reset()
+			with self._timer("free"): del fields
+			# Done with it. Move to next file
+			self.g3file = next_g3file
+			self.g3file.finish()
+			tadd(self.times, self.g3file.times, ["finish","scan"])
 			# Invalidate memory we're done with.
 			with self._timer("free"):
 				self.falloc.reset()
-				self.ballocs[0].reset()
+				self.alloc.ballocs[0].reset()
 			# Swap file buffer allocators, so we overwrite the oldest
 			# buffer next time
-			self.ballocs = self.ballocs[::-1]
-		# Last file doesn't have a next one to start
+			self.alloc.swap()
+		# Last file doesn't have a next one to start, but we may have
+		# callback to allow us to chain with external async code.
+		# When this is called, it is safe to overwrite alloc.ballocs[1]
+		self._next_read_callback()
 		for field_name, val in self._queue.items():
 			self.g3file.queue(field_name, **val, allocator=self.falloc)
-		fields = self.g3file.read(allocator=self.falloc)
+		fields = self.g3file.read(allocator=self.alloc.falloc)
 		tadd(self.times, self.g3file.times, ["alloc","extract"])
 		tadd(self.cum_times, self.times)
 		yield fields
@@ -285,8 +299,8 @@ class G3MultiFile:
 		# Reset the last buffers
 		with self._timer("free"):
 			del fields
-			self.falloc.reset()
-			self.ballocs[0].reset()
+			self.alloc.falloc.reset()
+			self.alloc.ballocs[0].reset()
 			self._queue = {}
 		tadd(self.cum_times, self.times)
 	def __enter__(self): return self
@@ -294,8 +308,7 @@ class G3MultiFile:
 		# Clean up memory. The buffer contains the whole raw file
 		# read into memory
 		self.g3file = None
-		self.ballocs= None
-		self.falloc = None
+		self.alloc  = None
 	# We do not support read_field here, as it would
 	# be too inefficient
 	def __repr__(self):
@@ -309,6 +322,61 @@ class G3MultiFile:
 			msg += " %-*s: %s,\n" % (nchar, "'"+fieldname+"'", str(fdesc))
 		msg += "}"
 		return msg
+	@property
+	def times(self): return self._timer.data
+	@property
+	def cum_times(self): return self._cum_timer.data
+
+class G3MultiMultiFile:
+	"""Class for chaining reads of multiple G3MultiFiles together.
+	This is useful to allow buffer reuse between them, and to allow
+	interleaving the extraction of the last file in one with the
+	reading of the first file in the next"""
+	def __init__(self, fname_lists, reuse="full", alloc=None):
+		self.alloc       = allocs or G3MultiAlloc(reuse=reuse)
+		self.fname_lists = list(fname_lists)
+		self._timer = Timer(["getsize","alloc","start","finish","scan","extract","free"])
+		self._cum_timer = Timer(self._timer.names)
+	@property
+	def nlist(self): return len(self.fname_lists)
+	def __enter__(self): return self
+	def __exit__(self, type, value, traceback):
+		self.mfile      = None
+		self.next_mfile = None
+		self.alloc      = None
+	def __iter__(self):
+		if len(self.fname_lists) == 0: return
+		self.mfile      = None
+		self.next_mfile = None
+		# Make it easier to handle start and end of loop
+		work_list   = self.fname_lists+[None]
+		for fi in range(-1,self.nlist):
+			if fi < self.nlist-1:
+				next_fnames = self.fname_lists[fi+1]
+				def start_next():
+					# This will be called when the current mfile has just finished
+					# its last read from disk. It will start writing to
+					# self.alloc.ballocs[1], which has just become available
+					self.next_mfile = G3MultiFile(next_fnames, alloc=self.alloc, async_init=True)
+				self.mfile._next_read_callback = start_next
+			# ok, process the current file, if we have one yet
+			if self.mfile:
+				# Yield the mfile to the caller. We will regain control
+				# when reader is finished with all files in this mfile.
+				# At this point self.alloc.balloc[0] and self.alloc.falloc
+				# will be invalidated, in time for mfile.finish() below to
+				# use them.
+				yield self.mfile
+				self.times.reset()
+				tadd(self.times, self.mfile.times)
+				tadd(self.cum_times, self.times)
+			# Wait for next file to be ready
+			if self.next_mfile:
+				self.mfile      = self.next_mfile
+				self.mfile.finish()
+				self.next_mfile = None
+	def __repr__(self):
+		return "G3MultiMultiFile(%s)" % str(self.fname_lists)
 	@property
 	def times(self): return self._timer.data
 	@property
@@ -400,6 +468,20 @@ class BufAlloc:
 		self.pos = 0
 	def __repr__(self): return "BufAlloc(name='%s', size=%d, pos=%d)" % (self.name, self.size, self.pos)
 
+class FixedAlloc(BufAlloc):
+	"""Allocator that uses an existing buffer"""
+	def __init__(self, buffer, name="[unnamed]"):
+		self.pos    = 0
+		self.buffer = buffer.view(np.uint8)
+		self.size   = buffer.size
+		self.old    = []
+		self.name   = name
+	def bytes(self, nbyte):
+		res = self.buffer[self.pos:self.pos+nbyte]
+		self.pos = round_up(self.pos+nbyte,self.align)
+		return res
+	def __repr__(self): return "FixedAlloc(name='%s', size=%d, pos=%d)" % (self.name, self.size, self.pos)
+
 class DummyAlloc:
 	def __init__(self, name="[unnamed]", size=512, growth_factor=1.5):
 		self.name   = name
@@ -410,6 +492,20 @@ class DummyAlloc:
 	def array(self, arr): return np.array(arr)
 	def reset(self): pass
 	def __repr__(self): return "DummyAlloc(name='%s')" % (self.name)
+
+class G3MultiAlloc:
+	"""Class representing the three allocators needed to perform
+	inteleaved reads and extracts in G3MultiFile"""
+	def __init__(self, reuse="full"):
+		if reuse not in ["full","partial","none"]:
+			raise ValuError("Unknown buffer reuse strategy '%s'" % str(reuse))
+		self.reuse = reuse
+		batype = BufAlloc if reuse in ["full","partial"] else DummyAlloc
+		fatype = BufAlloc if reuse in ["full"] else DummyAlloc
+		self.ballocs = [batype("buf%d" % i) for i in range(2)]
+		self.falloc  = fatype("fields")
+	def swap(self):
+		self.ballocs = self.ballocs[::-1]
 
 class Timer:
 	def __init__(self, names):
@@ -428,10 +524,14 @@ class Timer:
 	def reset(self):
 		self.data = {name:[0,0] for name in self.names}
 
-def tadd(a, b, names=None):
+def tadd(a, b, names=None, map=None):
 	if names is None: names = b.keys()
 	for name in names:
-		da = a[name]
+		# This is clumsy, and only needed because operating
+		# directly on the entries is cumbersome
+		if map and name in map: oname = map[name]
+		else: oname = name
+		da = a[oname]
 		db = b[name]
 		for i in range(2):
 			da[i] += db[i]

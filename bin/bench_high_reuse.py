@@ -14,7 +14,7 @@ from fast_g3.g3file import Timer, tadd, BufAlloc, AsyncReader
 # slower than bench_high_async.py on systems where
 # read and extract take about the same time.
 
-names = ["read","alloc","scan","extract","free"]
+names = ["getsize","start","alloc","scan","extract","finish","free"]
 cum_timer = Timer(names)
 
 def ftime(times, names):
@@ -40,9 +40,7 @@ for fi, ifile in enumerate(args.ifiles):
 	# This has async in the name, but we're not using it asynchronously
 	# here, we're just using it as a way to read a file with control of
 	# how the memory is allocated
-	with timer("read"):
-		with AsyncReader(ifile, allocator=read_alloc) as raw_reader: pass
-	with fast_g3.open(ifile, buffer=raw_reader.buf) as reader:
+	with fast_g3.open(ifile, allocator=read_alloc) as reader:
 		data = reader.read(allocator=extract_alloc)
 		tadd(timer.data, reader.times)
 		tadd(cum_timer.data, timer.data)

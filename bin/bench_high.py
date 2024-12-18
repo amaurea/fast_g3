@@ -24,7 +24,7 @@ from fast_g3.g3file import Timer, tadd
 # which uses the high-level multi-file interface.
 # That's the way I recommend reading multiple files.
 
-names = ["read","alloc","scan","extract"]
+names = ["getsize","start","alloc","scan","extract","finish"]
 cum_timer = Timer(names)
 
 def ftime(times, names):

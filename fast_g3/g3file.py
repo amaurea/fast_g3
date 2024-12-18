@@ -349,7 +349,7 @@ class G3MultiMultiFile:
 
 	with G3MultiMultiFile() as mmfile:
 		# queue up the file lists to iterate over
-		mmfile.queue([wafer2file1,wafer2file2,...])
+		mmfile.queue([wafer1file1,wafer1file2,...])
 		mmfile.queue([wafer2file1,wafer2file2,...])
 		...
 		for f in mmfile:

@@ -172,15 +172,19 @@ FLAC__bool FlacEofBuf(const FLAC__StreamDecoder *decoder, void *client_data) {
 FLAC__StreamDecoderWriteStatus FlacWriteBuf(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 *const buffer[], void *client_data) {
 	FlacHelper * info = (FlacHelper*)client_data;
 	ssize_t n = frame->header.blocksize*4;
-	// Figure out how much to copy out
-	int64_t ostart = std::max(info->oskip, info->opos);
-	int64_t oend   = std::min(info->osize, info->opos+n);
-	int64_t on     = oend-ostart;
-	if(on > 0) memcpy((char*)info->odata+(ostart-info->oskip), buffer[0]+(ostart-info->opos), on);
+	// Sample range we want
+	int64_t ostart = info->oskip;
+	int64_t oend   = info->oskip+info->osize;
+	// Subset of this we have in this chunk
+	int64_t cstart = std::max(ostart, info->opos);
+	int64_t cend   = std::min(oend,   info->opos+n);
+	// Bytes we will handle for this chunk
+	int64_t ncopy  = cend-cstart;
+	if(ncopy > 0) memcpy((char*)info->odata+(cstart-info->oskip), (const char*)buffer[0]+(cstart-info->opos), ncopy);
 	info->opos += n;
 	// Stop if we're past the end. This isn't necessarily
 	// an error, so caller should check info->opos
-	if(info->opos >= info->osize) return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+	if(info->opos >= oend) return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
 	else return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 void FlacErrBuf(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data) {

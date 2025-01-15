@@ -399,7 +399,7 @@ void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo, Frame & fram
 	}
 }
 
-ScanInfo scan(Buffer & buf) {
+ScanInfo scan(Buffer & buf, int32_t until_frame_type = -1) {
 	ScanInfo sinfo;
 	// Loop over frames in file
 	for(int framei = 0; buf.pos < buf.size; framei++) {
@@ -408,6 +408,7 @@ ScanInfo scan(Buffer & buf) {
 		int32_t version = buf.read<int32_t>(); (void)version;
 		int32_t nfield  = buf.read<int32_t>(); (void)nfield;
 		frame.type      = buf.read<int32_t>();
+		if(frame.type == until_frame_type) break;
 		process_fields(buf, nfield, sinfo, frame);
 		sinfo.frames.push_back(frame);
 		sinfo.nsamp += sinfo.curnsamp;
@@ -643,13 +644,15 @@ PyObject * expand_simple(const Frames & frames, Buffer buf) {
 
 extern "C" {
 
-static PyObject * scan_py(PyObject * self, PyObject * args) {
+static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	Py_buffer pybuf;
-	if(!PyArg_ParseTuple(args, "y*", &pybuf)) return NULL;
+	int32_t until_frame_type = -1;
+	static const char * kwlist[] = {"buffer", "until_frame_type", NULL};
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|i", (char**)kwlist, &pybuf, &until_frame_type)) return NULL;
 	// Scan the file
 	Buffer buf(pybuf.buf, pybuf.len);
 	ScanInfo sinfo;
-	try { sinfo = scan(buf); }
+	try { sinfo = scan(buf, until_frame_type); }
 	catch (const std::runtime_error & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;
@@ -884,7 +887,7 @@ PyDoc_STRVAR(end_async_read__doc,
 );
 
 static PyMethodDef methods[] = {
-	{"scan", scan_py, METH_VARARGS, scan__doc},
+	{"scan", (PyCFunction)scan_py, METH_VARARGS|METH_KEYWORDS, scan__doc},
 	{"extract", (PyCFunction)extract_py, METH_VARARGS|METH_KEYWORDS, read__doc},
 	{"start_async_read", start_async_read_py, METH_VARARGS, start_async_read__doc},
 	{"end_async_read", end_async_read_py, METH_VARARGS, end_async_read__doc},

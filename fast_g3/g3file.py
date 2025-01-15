@@ -79,14 +79,16 @@ class G3File:
 		* rows: Array-like of which rows to read for a 2d field.
 		  E.g. [5,0,10] to read the 5th,0th and 10th rows in that order.
 		  Default: None, which reads all rows.
-		* samps: (start,end) tuple for which sub-set of samples to read in
+		* samps: (start,end) tuple for which sub-set of samples to read
 		* oarr: Write the output to this array. It must be contiguous
 		  along the last axis, and match the dtype and shape of the field
 		  after row and sample selection."""
 		self._queue[field_name] = self._prepare_request(field_name, rows=rows, samps=samps, oarr=oarr, allocator=allocator)
-	def read(self, allocator=None):
+	def read(self, allocator=None, samps=None):
 		"""Read all the queued-up fields in parallel, or every field if
-		queue() was not used.
+		queue() was not used. The samps argument is a (start,end)
+		tuple for which sub-set of samples to read, but is only for the
+		case when queue() was not used.
 
 		Returns a dictionary of {field_name:field_data}. The misc fields
 		are also included in this dictionary under the key "frames".
@@ -94,7 +96,7 @@ class G3File:
 		# If we don't have a queue, then read everything
 		if len(self._queue) == 0:
 			for name in self.fields:
-				self.queue(name, allocator=allocator)
+				self.queue(name, allocator=allocator, samps=samps)
 		# Do the actual extraction
 		with self._timer("extract"):
 			extract(self._reader.buf, self._meta, self._queue)
@@ -181,6 +183,41 @@ class AsyncReader:
 
 async_read = AsyncReader
 
+# Sample range support for G3MultiFile can't work the same way
+# as for G3File. The big win here would be from not reading
+# unneeded files in the first place, and in this case it wouldn't
+# make sense to allow different ranges per field. If I allowed that,
+# then I would need to find the union of the field file ranges to
+# figure out which files to read. I don't think the effort needed
+# to support this is worth it. So samps will instead be an argument
+# to the constructor.
+#
+# Also, unless we only want to be able to skip files at the end,
+# we need to know the number of samples per file beforehand.
+# Supporting both the known-samples and unknown-samples case is also
+# cumbersome for little benefit, so I will require that samps
+# and file_nsamps are passed together.
+#
+# Finally, the first file will be read anyway. It's needed for
+# field information. Some necessary metadata is only present
+# in the first file. This could be hacked around by reading just
+# the first MB of the file or something to find these special
+# fields, but that gets very hacky.
+#
+# Actually, always reading the first file makes the interlaced
+# reads later messy. Much easier to just filter the file list
+# in the beginning. Then the rest of the logic doesn't need to
+# be touched. This is faster too. But it requires the hacky
+# first-file-field-metadata solution.
+#
+# This would be a function that reads in enough data to capture
+# all the non-data frames, which we assume are small and at the
+# beginning of the first file. This would then be scanned with
+# a variant of scan that stops when it hits the first data frame.
+# Finally, the total field metadata will be the union of this
+# field info and the one read from the first file we're actually
+# interested in.
+
 class G3MultiFile:
 	"""G3File: High-level interface interleaving the reading
 	and extraction of multiple g3 files. Uses asynchronous
@@ -233,13 +270,50 @@ class G3MultiFile:
 	of the reading code itself, e.g. when you free the data yielded from
 	read (which can happen as part of your for loop).
 
+	Unlike G3File, metadata fields are not easily available in this class.
+	Different files in a multifile may contain different metadata frames.
+	In SO, the necessary metadata is only in the first file, may not be
+	read when using sample ranges. To solve this problem, I provide the
+	function fast_g3.get_header_frames(fname). This reads only the
+	beginning of a file, and returns the first non-scan frames. This is a
+	very cheap operation.
+
 	open_multi is an alias for G3MultiFile.
 
 	Built on the low-level interface scan(), extract(), start_async_read()
 	and end_async_read()."""
 	def __init__(self, fnames, reuse="full", alloc=None, async_init=False,
-			_next_read_callback=None):
-		self.fnames = fnames
+			samps=None, file_nsamps=None, _next_read_callback=None):
+		"""Initialize a G3MultiFile
+
+		Arguments:
+		* fnames: List of files to read
+		* reuse: Buffer reuse mode
+		  * "full" (default): Reuse both file buffers and output array buffers.
+		    This is fastest, but means that the data yielded from read() is only
+		    valid for that iteration - by the time of the next yield it will be
+		    invalid. You must therefore copy the data if you want to keep it
+		    around.
+		  * "partial": Reuse only the file buffers. Use this if the behavior in
+		    "full" is problematic for you. Medium speed.
+		  * "none": Don't reuse any buffers. Slowest, with no advantages compared
+		    to "partial".
+		* alloc: A G3MultiAlloc to use for buffer and output array buffers.
+		  Overrides the reuse argument.
+		* async_init: Whether init should be asynchronous. If True, construction
+		  won't be complete until .finish() is called.
+		* samps: Optional tuple (start,end) of the sub-range of samples to read out.
+		  The range spans across all the files. Any files that don't overlap
+		  with this range will be skipped. The sample selection is propagated
+		  to G3File, so only the necessary parts of the remaining files will
+		  be read. Requires file_nsamps to be passed, so prior knowledge of
+		  the number of samples in all the files is necessary!
+		* file_nsamps: Optional list of the number of samples in each file.
+		  Required when samps is passed.
+		* _next_read_callback: Used by G3MultiMultiFile to efficiently chain
+		  reads."""
+		self.fnames_full = fnames
+		self.fnames, self.sranges = _get_active_files(fnames, samps, file_nsamps)
 		# These provide timing data. The timing information clutters up
 		# this class quite a bit, but it was useful when debugging
 		# performance
@@ -249,7 +323,7 @@ class G3MultiFile:
 		self.alloc = alloc or G3MultiAlloc(reuse=reuse)
 		# First file doesn't benefit from async, but easiest to do it
 		# this way anyway in light of the allocator
-		self.g3file = G3File(fnames[0], allocator=self.alloc.ballocs[1], async_init=True)
+		self.g3file = G3File(self.fnames[0], allocator=self.alloc.ballocs[1], async_init=True)
 		# Allow interleaved read chaining
 		self._next_read_callback = _next_read_callback or (lambda: None)
 		self.finished = False
@@ -259,11 +333,13 @@ class G3MultiFile:
 		self.g3file.finish()
 		self.alloc.swap()
 		tadd(self.times, self.g3file.times)
-		# This meta is only representative of the first file
+		# Metdata for the first file we read
 		self._meta  = self.g3file._meta
 		self.fields = {key:MultiField(val["shape"],val["dtype"],val["names"]) for key,val in self._meta["fields"].items()}
 		self._queue = {}
 		self.finished = True
+	@property
+	def nfile_full(self): return len(self.fnames_full)
 	@property
 	def nfile(self): return len(self.fnames)
 	def queue(self, field_name, rows=None):
@@ -275,8 +351,8 @@ class G3MultiFile:
 			next_g3file = G3File(self.fnames[fi+1], allocator=self.alloc.ballocs[1], async_init=True)
 			# Process current file
 			for field_name, val in self._queue.items():
-				self.g3file.queue(field_name, **val, allocator=self.falloc)
-			fields = self.g3file.read(allocator=self.alloc.falloc)
+				self.g3file.queue(field_name, **val, allocator=self.falloc, samps=self.sranges[fi])
+			fields = self.g3file.read(allocator=self.alloc.falloc, samps=self.sranges[fi])
 			tadd(self.times, self.g3file.times, ["alloc","extract"])
 			tadd(self.times, next_g3file.times, ["getsize","alloc","start"])
 			tadd(self.cum_times, self.times)
@@ -299,8 +375,8 @@ class G3MultiFile:
 		# When this is called, it is safe to overwrite alloc.ballocs[1]
 		self._next_read_callback()
 		for field_name, val in self._queue.items():
-			self.g3file.queue(field_name, **val, allocator=self.falloc)
-		fields = self.g3file.read(allocator=self.alloc.falloc)
+			self.g3file.queue(field_name, **val, allocator=self.falloc, samps=self.sranges[-1])
+		fields = self.g3file.read(allocator=self.alloc.falloc, samps=self.sranges[-1])
 		tadd(self.times, self.g3file.times, ["alloc","extract"])
 		tadd(self.cum_times, self.times)
 		yield fields
@@ -335,6 +411,49 @@ class G3MultiFile:
 	def times(self): return self._timer.data
 	@property
 	def cum_times(self): return self._cum_timer.data
+
+def get_header_frames(fname, nbyte=1000000, until_frame_type=0x53):
+	"""Fast function for reading the frame metadata for the initial
+	small frames in fname. This assumes that these frames are at
+	the beginning of the file; that parsing can stop when a frame
+	with type until_frame_type is hit, and that this will be contained
+	in the first nbyte bytes in the file. This is pretty SO-specific!
+
+	Arguments:
+	* fname: The file name to read from
+	* nbyte: How many bytes to read. Defaults to 1 million bytes, which
+	  should be enough by a good margin.
+	* until_frame_type: Stop parsin when a frame with this type number
+	  is rached. Defaults to 0x53, the frame type for the heavy Scan
+	  frames."""
+	with open(fname, "rb") as f:
+		data = f.read(nbyte)
+		return scan(data, until_frame_type=until_frame_type)
+
+def _get_active_files(fnames, samps=None, file_nsamps=None, allow_none=False):
+	if samps is None:
+		return fnames, [None for fname in fnames]
+	else:
+		if file_nsamps is None or len(file_nsamps) != len(fnames):
+			raise ValueError("When samps is given, file_nsamps must also be present, and be a list of the number of samples (per row/detector) in each of the files given")
+		ofnames = []
+		sranges = []
+		file_start = 0
+		for fi, (fname, nsamp) in enumerate(zip(fnames, file_nsamps)):
+			file_end = file_start+nsamp
+			if file_start < samps[1] and file_end > samps[0]:
+				# We have a sample overlap. What's the first and last sample
+				# of this file we want?
+				my_start = max(file_start, samps[0])-file_start
+				my_end   = min(file_end,   samps[1])-file_start
+				ofnames.append(fname)
+				sranges.append((my_start,my_end))
+			file_start = file_end
+		# Make sure there's at least one active file
+		if len(ofnames) == 0 and not allow_none:
+			ofnames = fnames[:1]
+			sranges = (0,1)
+		return ofnames, sranges
 
 # Consider replacing the long list of lists interface to
 # G3MultiMuliFile with a minimal constructor, and then
@@ -371,10 +490,21 @@ class G3MultiMultiFile:
 		self.fname_lists = []
 		self._timer = Timer(["getsize","alloc","start","finish","scan","extract","free"])
 		self._cum_timer = Timer(self._timer.names)
-	def queue(self, fnames):
+	def queue(self, fnames, samps=None, file_nsamps=None):
 		"""Queue up a list of file names. When iterating over a G3MultiMultiFile,
-		one G3MultiFile will be yielded for each list of fnames queued up this way."""
-		self.fname_lists.append(fnames)
+		one G3MultiFile will be yielded for each list of fnames queued up this way.
+
+		Arguments:
+		* fnames: List of files to read
+		* samps: Optional tuple (start,end) of the sub-range of samples to read out.
+		  The range spans across all the files. Any files that don't overlap
+		  with this range will be skipped. The sample selection is propagated
+		  to G3File, so only the necessary parts of the remaining files will
+		  be read. Requires file_nsamps to be passed, so prior knowledge of
+		  the number of samples in all the files is necessary!
+		* file_nsamps: Optional list of the number of samples in each file.
+		  Necessary when samps is passed."""
+		self.fname_lists.append({"fnames":fnames, "samps":samps, "file_nsamps":file_nsamps})
 	@property
 	def nlist(self): return len(self.fname_lists)
 	def __enter__(self): return self
@@ -385,7 +515,7 @@ class G3MultiMultiFile:
 	def __iter__(self):
 		if len(self.fname_lists) == 0: return
 		# Handle the first file
-		self.mfile = G3MultiFile(self.fname_lists[0], alloc=self.alloc)
+		self.mfile = G3MultiFile(**self.fname_lists[0], alloc=self.alloc)
 		self.next_mfile = None
 		for fi in range(self.nlist):
 			# If we still have more files left after the current, prepare fot it
@@ -395,7 +525,7 @@ class G3MultiMultiFile:
 					# This will be called when the current mfile has just finished
 					# its last read from disk. It will start writing to
 					# self.alloc.ballocs[1], which has just become available
-					self.next_mfile = G3MultiFile(next_fnames, alloc=self.alloc, async_init=True)
+					self.next_mfile = G3MultiFile(**next_fnames, alloc=self.alloc, async_init=True)
 				self.mfile._next_read_callback = start_next
 			# Yield the mfile to the caller. We will regain control
 			# when reader is finished with all files in this mfile.

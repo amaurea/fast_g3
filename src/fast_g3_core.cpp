@@ -45,6 +45,24 @@
 // Entry = { string name; int64_t buf0, nbyte; enum etype; };
 // This would then be translated to Python objects later.
 
+// How to handle reading only some sub-range of the samples?
+// [------------------- file1 --------------][ ----------------- file2 ---------------][...]
+// [-- frame1 --][-- frame2 --][-- frame3 --][-- frame1 --][-- frame2 --][-- frame3 --][...]
+//                      [--------- samprange --------]
+// In terms of global samples (at the python level):
+//  * For each file, check if we need anything
+//    If samprange[0] >= file_end or samprange[1] < file_start, then skip the file
+//  * Define file-relative samprange: fsamprange = samprange - file_start
+//  * For each frame in file, check if we need anything
+//    If fsamprange[0] >= frame_end = segment.samp0+segment.nsamp
+//    or fsamprange[1] < frame_start = segment.samp0, then skip the segment
+//  * Work needs to be modified in two ways:
+//    1. obuf was &arr[samp0], but should be &arr[samp0-fsamprange[0]]
+//    2. Work-processing code needs to know the segment-relative range:
+//       ssamprange = fsamprange - frame_start
+//    Work-processing will then skip ssamprange[0] samples, and then
+//    copy out ssamprange[1]-ssamprange[0] samples
+
 using std::string;
 using std::vector;
 enum class FType { None, G3Int, G3Double, G3String, G3Time, G3VectorInt8, G3VectorInt16, G3VectorInt32, G3VectorInt64, G3VectorDouble, G3VectorBool, G3TimesampleMap, G3SuperTimestream };
@@ -61,7 +79,7 @@ struct ScanInfo {
 	ScanInfo():nsamp(0),curnsamp(0) {}
 	int64_t nsamp, curnsamp; Fields fields; Frames frames;
 };
-struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte; double quantum; int npy_type, itemsize; uint8_t algo; };
+struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte, oskip; double quantum; int npy_type, itemsize; uint8_t algo; };
 typedef vector<Work> WorkList;
 // Used for async reads
 struct AioTask {
@@ -117,9 +135,11 @@ struct Buffer {
 };
 
 struct FlacHelper {
-	const void * idata;
-	void * odata;
-	int64_t ipos, isize, opos, osize;
+	const void * idata;   // input buffer
+	void * odata;         // output buffer
+	int64_t ipos, isize;  // input offset and size
+	int64_t opos, osize;  // output offset and size. Can be smaller than full stream
+	int64_t oskip;        // number of output bytes to skip at the beginning
 };
 
 FLAC__StreamDecoderReadStatus FlacReadBuf(const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], size_t *bytes, void *client_data) {
@@ -152,10 +172,16 @@ FLAC__bool FlacEofBuf(const FLAC__StreamDecoder *decoder, void *client_data) {
 FLAC__StreamDecoderWriteStatus FlacWriteBuf(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 *const buffer[], void *client_data) {
 	FlacHelper * info = (FlacHelper*)client_data;
 	ssize_t n = frame->header.blocksize*4;
-	if(info->opos+n > info->osize) return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-	memcpy((char*)info->odata+info->opos, buffer[0], n);
+	// Figure out how much to copy out
+	int64_t ostart = std::max(info->oskip, info->opos);
+	int64_t oend   = std::min(info->osize, info->opos+n);
+	int64_t on     = oend-ostart;
+	if(on > 0) memcpy((char*)info->odata+(ostart-info->oskip), buffer[0]+(ostart-info->opos), on);
 	info->opos += n;
-	return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+	// Stop if we're past the end. This isn't necessarily
+	// an error, so caller should check info->opos
+	if(info->opos >= info->osize) return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+	else return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 void FlacErrBuf(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data) {
 	fprintf(stderr, "FLAC error: %d\n", status);
@@ -164,13 +190,16 @@ void FlacErrBuf(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStat
 struct FlacDecoder {
 	FlacDecoder()  { decoder = FLAC__stream_decoder_new(); }
 	~FlacDecoder() { FLAC__stream_decoder_delete(decoder); }
-	int decode(const void * idata, void * odata, int64_t isize, int64_t osize) {
-		FlacHelper info = { idata, odata, 0, isize, 0, osize };
+	int decode(const void * idata, void * odata, int64_t isize, int64_t osize, int64_t ostart = 0) {
+		FlacHelper info = { idata, odata, 0, isize, 0, osize, ostart };
 		int err = 0;
 		if((err=FLAC__stream_decoder_init_stream(decoder, FlacReadBuf, FlacSeekBuf,
 				FlacTellBuf, FlacLenBuf, FlacEofBuf, FlacWriteBuf, NULL, FlacErrBuf,
 				(void*)&info))!=FLAC__STREAM_DECODER_INIT_STATUS_OK) return 1;
-		if(!(err=FLAC__stream_decoder_process_until_end_of_stream(decoder))) return 2;
+		if(!(err=FLAC__stream_decoder_process_until_end_of_stream(decoder))) {
+			// We can end up here if we aborted earlier. Not an error if we got enough data
+			if(info.opos < info.osize) return 2;
+		}
 		if(!(err=FLAC__stream_decoder_finish(decoder))) return 3;
 		return 0;
 	}
@@ -416,9 +445,10 @@ void decode_flac(const Work & work, Buffer & ibuf) {
 	int64_t isize = ibuf.read<uint32_t>();
 	// Decode into a temporary output buffer
 	int nsamp = work.onbyte/work.itemsize;
+	int nskip = work.oskip /work.itemsize;
 	vector<int32_t> tmp(nsamp);
 	FlacDecoder flac;
-	if(flac.decode(ibuf.data+ibuf.pos, &tmp[0], isize, nsamp*4))
+	if(flac.decode(ibuf.data+ibuf.pos, &tmp[0], isize, nsamp*4, nskip*4))
 		throw std::runtime_error("Error decoding FLAC data");
 	// Copy to target buffer why expanding to target precision
 	if     (work.itemsize == 4) memcpy(work.obuf, &tmp[0], work.onbyte);
@@ -430,17 +460,17 @@ void decode_flac(const Work & work, Buffer & ibuf) {
 void add_offs_bz2(const Work & work, Buffer & ibuf) {
 	int nsamp = work.onbyte/work.itemsize;
 	unsigned int isize = (unsigned int) ibuf.read<uint32_t>();
-	unsigned int osize = (unsigned int) work.onbyte;
+	unsigned int otot  = (unsigned int) (work.onbyte+work.oskip);
 	// Decode into a temporary buffer of the right size
 	// Can save memory by setting the "small" (second to last)
 	// argument to 1, but this halves the decompression speed
 	// according to the documentation
-	vector<char> tmp(work.onbyte);
-	int err = BZ2_bzBuffToBuffDecompress(&tmp[0], &osize, (char*)ibuf.data+ibuf.pos, isize, 0, 0);
-	if(err != BZ_OK) throw std::runtime_error("Error decoding BZ2 data");
+	vector<char> tmp(otot);
+	int err = BZ2_bzBuffToBuffDecompress(&tmp[0], &otot, (char*)ibuf.data+ibuf.pos, isize, 0, 0);
+	if(err != BZ_OK && err != BZ_OUTBUFF_FULL) throw std::runtime_error("Error decoding BZ2 data");
 	// Add to the actual output buffer
-	if     (work.itemsize == 4) add_arr<int32_t>(work.obuf, &tmp[0], nsamp);
-	else if(work.itemsize == 8) add_arr<int64_t>(work.obuf, &tmp[0], nsamp);
+	if     (work.itemsize == 4) add_arr<int32_t>(work.obuf, &tmp[work.oskip], nsamp);
+	else if(work.itemsize == 8) add_arr<int64_t>(work.obuf, &tmp[work.oskip], nsamp);
 	else throw std::runtime_error("Only 32-bit and 64-bit supported");
 	ibuf.pos += isize;
 }
@@ -470,7 +500,7 @@ void zero_buffer(const Work & work) {
 // Process a single work item
 void read_work(const Work & work) {
 	// No compression. Simple memcpy
-	if(work.algo == 0) memcpy(work.obuf, work.ibuf, work.onbyte);
+	if(work.algo == 0) memcpy(work.obuf, (char*)work.ibuf+work.oskip, work.onbyte);
 	else {
 		// First decode the data
 		// bz2 and const usually add to the result from flac,
@@ -719,6 +749,16 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 		// Get the output array. Python side must ensure this is
 		// contiguous and has the right shape and dtype
 		PyArrayObject * arr = (PyArrayObject*)PyDict_GetItemString(oinfo, "oarr"); if(!arr)   return NULL;
+		// We may want to read out just a sub-range [start:end] of the full
+		// number of samples. We assume that oarr.shape[-1] = end-start, so
+		// we just need an extra parameter to encode the start. We will call it
+		// "skip". We allow "skip" to be missing
+		int64_t ostart = 0;
+		PyObject * obj_skip = PyDict_GetItemString(oinfo, "skip");
+		if(obj_skip) {
+			ostart = PyLong_AsLong(obj_skip); if(PyErr_Occurred()) return NULL;
+		} else PyErr_Clear();
+		int64_t oend = ostart + PyArray_SHAPE(arr)[PyArray_NDIM(arr)-1];
 		// Loop through the segments
 		PyArrayObject * segments = (PyArrayObject*)PyDict_GetItemString(finfo, "segments"); if(!segments) return NULL;
 		if(PyArray_NDIM(segments) != 2 || PyArray_TYPE(segments) != NPY_INT64 || PyArray_DIM(segments,1) != 7) return NULL;
@@ -738,13 +778,20 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 			int64_t nbyte = *(int64_t*)PyArray_GETPTR2(segments, seg, 4);
 			double quantum= *(double *)PyArray_GETPTR2(segments, seg, 5);
 			uint8_t algo  = (uint8_t)*(int64_t*)PyArray_GETPTR2(segments, seg, 6);
-			void * dest;
-			if     (ndim == 1) dest = (void*)PyArray_GETPTR1(arr, samp0);
-			else if(ndim == 2) dest = (void*)PyArray_GETPTR2(arr, ind, samp0);
-			else return NULL;
-			// This should be all we need to know
-			Work work = { (char*)pybuf.buf+buf0, dest, nbyte, nsamp*itemsize, quantum, npy_type, itemsize, algo };
-			worklist.push_back(work);
+			// Calculate the global sample range we want from this segment
+			int64_t sstart    = std::max(samp0,      ostart);
+			int64_t send      = std::min(samp0+nsamp,oend  );
+			int64_t nsamp_get =  send-sstart;
+			// Skip the segment if we don't want any of it
+			if(nsamp_get > 0) {
+				void * dest;
+				if     (ndim == 1) dest = (void*)PyArray_GETPTR1(arr, sstart-ostart);
+				else if(ndim == 2) dest = (void*)PyArray_GETPTR2(arr, ind, sstart-ostart);
+				else return NULL;
+				// This should be all we need to know
+				Work work = { (char*)pybuf.buf+buf0, dest, nbyte, nsamp_get*itemsize, (sstart-samp0)*itemsize, quantum, npy_type, itemsize, algo };
+				worklist.push_back(work);
+			}
 		}
 	}
 	// Phew! The work list is done. Do the actual work

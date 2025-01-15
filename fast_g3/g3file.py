@@ -51,7 +51,7 @@ class G3File:
 		self.finished = True
 	@property
 	def nsamp(self): return self._meta["nsamp"]
-	def read_field(self, field_name, rows=None, oarr=None, allocator=None):
+	def read_field(self, field_name, rows=None, samps=None, oarr=None, allocator=None):
 		"""Read a single field from the file. If you want more than
 		just one field, consider using read() instead.
 
@@ -60,16 +60,17 @@ class G3File:
 		* rows: Array-like of which rows to read for a 2d field.
 		  E.g. [5,0,10] to read the 5th,0th and 10th rows in that order.
 		  Default: None, which reads all rows.
+		  Default: None, which reads all rows.
 		* oarr: Write the output to this array. It must be contiguous
 		  along the last axis, and match the dtype and shape of the fied
-		  after row selection.
+		  after row and sample selection.
 
 		Returns a numpy array with the values from the field."""
-		request = {field_name:self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)}
+		request = {field_name:self._prepare_request(field_name, rows=rows, samps=samps, oarr=oarr, allocator=allocator)}
 		with self._timer("extract"):
 			extract(self._reader.buf, self._meta, request)
 		return request[field_name]["oarr"]
-	def queue(self, field_name, rows=None, oarr=None, allocator=None):
+	def queue(self, field_name, rows=None, samps=None, oarr=None, allocator=None):
 		"""Queue up a field to be read. All queued fields will
 		be read in parallel and returned by a subsequent read() call.
 
@@ -78,10 +79,11 @@ class G3File:
 		* rows: Array-like of which rows to read for a 2d field.
 		  E.g. [5,0,10] to read the 5th,0th and 10th rows in that order.
 		  Default: None, which reads all rows.
+		* samps: (start,end) tuple for which sub-set of samples to read in
 		* oarr: Write the output to this array. It must be contiguous
-		  along the last axis, and match the dtype and shape of the fied
-		  after row selection."""
-		self._queue[field_name] = self._prepare_request(field_name, rows=rows, oarr=oarr, allocator=allocator)
+		  along the last axis, and match the dtype and shape of the field
+		  after row and sample selection."""
+		self._queue[field_name] = self._prepare_request(field_name, rows=rows, samps=samps, oarr=oarr, allocator=allocator)
 	def read(self, allocator=None):
 		"""Read all the queued-up fields in parallel, or every field if
 		queue() was not used.
@@ -120,10 +122,11 @@ class G3File:
 	def frames(self): return self._meta["frames"]
 	@property
 	def times(self): return self._timer.data
-	def _prepare_request(self, field_name, rows=None, oarr=None, allocator=None):
+	def _prepare_request(self, field_name, rows=None, samps=None, oarr=None, allocator=None):
 		info  = self.fields[field_name]
 		# Allocate output array if necessary
-		shape = rowshape(info.shape,rows)
+		shape = rowshape(info.shape,rows,samps)
+		skip  = 0 if samps is None else samps[0]
 		if allocator is None: allocator = np
 		with self._timer("alloc"):
 			if oarr is None: oarr = allocator.empty(shape, info.dtype)
@@ -132,7 +135,7 @@ class G3File:
 		# Check that everything makes sense
 		if oarr.shape != shape or oarr.dtype != info.dtype or oarr.strides[-1] != oarr.itemsize:
 			raise ValueError("Field %s output array must have shape %s dtype %s and be contiguous along the last axis" % (name, str(shape), str(info.dtype)))
-		return {"oarr":oarr, "rows":rows}
+		return {"oarr":oarr, "rows":rows, "skip":skip}
 
 class Field:
 	def __init__(self, shape, dtype, names, segments, owner=None, field_name=None):
@@ -424,11 +427,16 @@ class MultiField:
 		else: shape_str = "(%d,?)" % self.shape[-2]
 		return "Field(shape=%s,dtype=%s,names:%s)" % (shape_str, str(self.dtype), format_names(self.names,35))
 
-def rowshape(shape, dets):
+def rowshape(shape, dets=None, samps=None):
 	"""Return the correct shape of a field output array
 	after row selection. Handles both 1d and 2d fields."""
-	if dets is None or len(shape)==1: return shape
-	else: return (len(dets),shape[1])
+	if len(shape) > 2: raise ValueError("Shape must be 1d or 2d")
+	nsamp = shape[-1]
+	ndet  = shape[-2] if len(shape)==2 else 1
+	if dets  is not None: ndet  = len(dets)
+	if samps is not None: nsamp = samps[1]-samps[0]
+	if len(shape) == 2: return (ndet,nsamp)
+	else: return (nsamp,)
 
 def format_names(names, maxlen):
 	msg = ",".join(names)

@@ -522,9 +522,13 @@ void read_work(const Work & work) {
 
 void read_worklist(const WorkList & worklist) {
 	int nwork = worklist.size();
-	_Pragma("omp parallel for schedule(dynamic)")
-	for(int wi = 0; wi < nwork; wi++)
-		read_work(worklist[wi]);
+	int nerr  = 0;
+	_Pragma("omp parallel for schedule(dynamic) reduction(+:nerr)")
+	for(int wi = 0; wi < nwork; wi++) {
+		try { read_work(worklist[wi]); }
+		catch (const std::exception & e) { nerr ++; }
+	}
+	if(nerr > 0) throw std::runtime_error("extract error in read_worklist");
 }
 
 // Asynchronous read stuff
@@ -653,7 +657,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	Buffer buf(pybuf.buf, pybuf.len);
 	ScanInfo sinfo;
 	try { sinfo = scan(buf, until_frame_type); }
-	catch (const std::runtime_error & e) {
+	catch (const std::exception & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;
 	}
@@ -803,7 +807,7 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 	}
 	// Phew! The work list is done. Do the actual work
 	try { read_worklist(worklist); }
-	catch (const std::runtime_error & e) {
+	catch (const std::exception & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;
 	}
@@ -816,7 +820,7 @@ static PyObject * start_async_read_py(PyObject * self, PyObject * args) {
 	if(!PyArg_ParseTuple(args, "sy*", &fname, &pybuf)) return NULL;
 	std::shared_ptr<AioTask> task;
 	try { task = start_async_read(fname, (char*)pybuf.buf, pybuf.len); }
-	catch(const std::runtime_error & e) {
+	catch(const std::exception & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;
 	}

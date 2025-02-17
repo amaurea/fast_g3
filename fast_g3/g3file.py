@@ -257,7 +257,7 @@ class G3MultiFile:
 	initialization will not finish until .finish() is called. This does
 	not affect .read(), which will use asyncronous reads internally
 	in either case. The purpose of this argument is to be able to start
-	initialization of the next G3MultFile when the previous one when the
+	initialization of the next G3MultiFile when the previous one when the
 	previous one is still extracting its last file.
 
 	Timing information can be accessed through .times and .cum_times, both
@@ -351,7 +351,7 @@ class G3MultiFile:
 			next_g3file = G3File(self.fnames[fi+1], allocator=self.alloc.ballocs[1], async_init=True)
 			# Process current file
 			for field_name, val in self._queue.items():
-				self.g3file.queue(field_name, **val, allocator=self.falloc, samps=self.sranges[fi])
+				self.g3file.queue(field_name, **val, allocator=self.alloc.falloc, samps=self.sranges[fi])
 			fields = self.g3file.read(allocator=self.alloc.falloc, samps=self.sranges[fi])
 			tadd(self.times, self.g3file.times, ["alloc","extract"])
 			tadd(self.times, next_g3file.times, ["getsize","alloc","start"])
@@ -375,7 +375,7 @@ class G3MultiFile:
 		# When this is called, it is safe to overwrite alloc.ballocs[1]
 		self._next_read_callback()
 		for field_name, val in self._queue.items():
-			self.g3file.queue(field_name, **val, allocator=self.falloc, samps=self.sranges[-1])
+			self.g3file.queue(field_name, **val, allocator=self.alloc.falloc, samps=self.sranges[-1])
 		fields = self.g3file.read(allocator=self.alloc.falloc, samps=self.sranges[-1])
 		tadd(self.times, self.g3file.times, ["alloc","extract"])
 		tadd(self.cum_times, self.times)

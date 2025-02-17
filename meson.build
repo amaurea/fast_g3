@@ -10,6 +10,6 @@ py.extension_module(
 	'src/fast_g3_core.cpp',
 	include_directories: [incdir_numpy],
 	dependencies : [flac,bzip2,openmp],
-	cpp_args: ['-Wfatal-errors'],
+	cpp_args: ['-Wfatal-errors', '-O0', '-fsanitize=address'],
 	install: true,
 )

@@ -70,14 +70,13 @@ struct Segment     { int64_t row, samp0, nsamp, buf0, nbyte; double quantum; uin
 struct SimpleField { int64_t buf0, nbyte; string name; FType type; };
 typedef vector<Segment> Segments;
 typedef vector<string> Names;
-struct Field    { int npy_type, ndim; Names names; Segments segments; };
+struct Field    { int npy_type, ndim; int64_t nsamp; Names names; Segments segments; };
 typedef vector<SimpleField> SimpleFields;
 struct Frame    { int32_t type; SimpleFields simple_fields; };
 typedef vector<Frame> Frames;
 typedef std::unordered_map<string,Field> Fields;
 struct ScanInfo {
-	ScanInfo():nsamp(0),curnsamp(0) {}
-	int64_t nsamp, curnsamp; Fields fields; Frames frames;
+	Fields fields; Frames frames;
 };
 struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte, oskip; double quantum; int npy_type, itemsize; uint8_t algo; };
 typedef vector<Work> WorkList;
@@ -230,7 +229,7 @@ bool contains(PyObject * obj, const char * name) {
 }
 Field & get_field(Fields & fields, const string & name, int npy_type, int ndim) {
 	if(!contains(fields, name)) {
-		Field new_field = { npy_type, ndim };
+		Field new_field = { npy_type, ndim, 0 };
 		fields[name] = new_field;
 	}
 	return fields[name];
@@ -252,15 +251,17 @@ void process_timesamplemap(Buffer & buf, int32_t nfield, const string & prefix, 
 		if(npy_type >= 0) {
 			subbuf.pos += 12;
 			Segment seg;
+			Field & field = get_field(sinfo.fields, field_name, npy_type, 1);
 			seg.row   = -1;
-			seg.samp0 = sinfo.nsamp;
+			seg.samp0 = field.nsamp;
 			seg.nsamp = subbuf.read<int64_t>();
 			seg.nbyte = seg.nsamp*numpy_type_size(npy_type);
 			seg.buf0  = subbuf.pos;
 			seg.quantum=0;
 			seg.algo  = 0;
-			// Insert into sinfo
-			get_field(sinfo.fields, field_name, npy_type, 1).segments.push_back(seg);
+			// Insert into field
+			field.segments.push_back(seg);
+			field.nsamp += seg.nsamp;
 		}
 		buf.pos += val_len;
 	}
@@ -277,8 +278,10 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	// Times are int64 ctimes in units of 10 ns
 	// The -4,+4 is because the decoder considers the starting length tag to be
 	// part of the input buffer
-	Segment tseg = { -1, sinfo.nsamp, nsamp, buf.pos-4, times_nbyte_comp+4, 0.0, times_algo };
-	get_field(sinfo.fields, name+"/times", NPY_INT64, 1).segments.push_back(tseg);
+	Field & tfield = get_field(sinfo.fields, name+"/times", NPY_INT64, 1);
+	Segment tseg = { -1, tfield.nsamp, nsamp, buf.pos-4, times_nbyte_comp+4, 0.0, times_algo };
+	tfield.segments.push_back(tseg);
+	tfield.nsamp += nsamp;
 	buf.pos += times_nbyte_comp;
 	buf.pos += 4; // skip names header
 	int64_t nname            = buf.read<int64_t>();
@@ -306,7 +309,6 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	buf.read_raw(noffset*4, &offsets[0]);
 	int32_t signal_nbyte_comp= buf.read<int32_t>();
 
-	sinfo.curnsamp = nsamp;
 	Field & field = get_field(sinfo.fields, name + "/data", npy_type, 2);
 	if(field.names.empty()) field.names.swap(names);
 	(void)ndim;
@@ -340,9 +342,10 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 		tot_size = none_size + flac_size + bz_size + const_size; (void)tot_size;
 		// Ok, done parsing this row
 		double quantum = nquanta > 0 ? quanta[ni] : 1.0;
-		Segment seg = { ni, sinfo.nsamp, nsamp, row_start, row_end-row_start, quantum, used_algo };
+		Segment seg = { ni, field.nsamp, nsamp, row_start, row_end-row_start, quantum, used_algo };
 		field.segments.push_back(seg);
 	}
+	field.nsamp += nsamp;
 	buf.pos += signal_nbyte_comp;
 }
 
@@ -411,7 +414,6 @@ ScanInfo scan(Buffer & buf, int32_t until_frame_type = -1) {
 		if(frame.type == until_frame_type) break;
 		process_fields(buf, nfield, sinfo, frame);
 		sinfo.frames.push_back(frame);
-		sinfo.nsamp += sinfo.curnsamp;
 		int32_t crc     = buf.read<int32_t>(); (void)crc;
 	}
 	return sinfo;
@@ -661,9 +663,13 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;
 	}
+	// Get our overall nsamp
+	int64_t overall_nsamp = 0;
+	for(const auto & [name, field] : sinfo.fields)
+		overall_nsamp = std::max(overall_nsamp, field.nsamp);
 	// Convert to python types
 	PyHandle meta = PyDict_New();
-	PyHandle nsamp = PyLong_FromUnsignedLong(sinfo.nsamp);if(!nsamp)return NULL;
+	PyHandle nsamp = PyLong_FromUnsignedLong(overall_nsamp);if(!nsamp)return NULL;
 	PyDict_SetItemString(meta, "nsamp", nsamp);
 	// Set up the fields
 	PyHandle fields = PyDict_New();
@@ -673,7 +679,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 		int nname = field.names.size();
 		PyHandle shape = PyTuple_New(field.ndim);
 		for(int32_t dim = 0; dim < field.ndim; dim++) {
-			int64_t val = dim == 0 ? sinfo.nsamp : dim == 1 ? nname : 1;
+			int64_t val = dim == 0 ? field.nsamp : dim == 1 ? nname : 1;
 			PyObject * pyval = PyLong_FromUnsignedLong(val); if(!pyval) return NULL;
 			PyTuple_SET_ITEM(shape.ptr, field.ndim-1-dim, pyval); // steals
 		}

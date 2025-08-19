@@ -86,6 +86,11 @@ struct AioTask {
 	~AioTask() { if(file) fclose(file); if(ao) delete ao; }
 	FILE * file; aiocb * ao;
 };
+// Used to automatically free Py_buffer
+struct Py_autobuf {
+	~Py_autobuf() { PyBuffer_Release(&pb); }
+	Py_buffer pb;
+};
 
 // printf that returns a new string
 string fmt(const char * format, ...) {
@@ -651,12 +656,12 @@ PyObject * expand_simple(const Frames & frames, Buffer buf) {
 extern "C" {
 
 static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
-	Py_buffer pybuf;
+	Py_autobuf pybuf;
 	int32_t until_frame_type = -1;
 	static const char * kwlist[] = {"buffer", "until_frame_type", NULL};
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|i", (char**)kwlist, &pybuf, &until_frame_type)) return NULL;
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|i", (char**)kwlist, &pybuf.pb, &until_frame_type)) return NULL;
 	// Scan the file
-	Buffer buf(pybuf.buf, pybuf.len);
+	Buffer buf(pybuf.pb.buf, pybuf.pb.len);
 	ScanInfo sinfo;
 	try { sinfo = scan(buf, until_frame_type); }
 	catch (const std::exception & e) {
@@ -723,10 +728,10 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 
 
 PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
-	Py_buffer pybuf;
+	Py_autobuf pybuf;
 	PyObject *meta = NULL, *fields=NULL;
 	static const char * kwlist[] = {"buffer", "meta", "fields", NULL};
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*OO", (char**)kwlist, &pybuf, &meta, &fields)) return NULL;
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "y*OO", (char**)kwlist, &pybuf.pb, &meta, &fields)) return NULL;
 	// Extract field dict from meta. GetItem gives borrowed ref, so no PyHandle
 	PyObject * meta_fields = PyDict_GetItemString(meta, "fields"); if(!fields)   return NULL;
 	PyObject * obj_nsamp   = PyDict_GetItemString(meta, "nsamp");  if(!obj_nsamp)return NULL;
@@ -806,7 +811,7 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 				else if(ndim == 2) dest = (void*)PyArray_GETPTR2(arr, ind, sstart-ostart);
 				else return NULL;
 				// This should be all we need to know
-				Work work = { (char*)pybuf.buf+buf0, dest, nbyte, nsamp_get*itemsize, (sstart-samp0)*itemsize, quantum, npy_type, itemsize, algo };
+				Work work = { (char*)pybuf.pb.buf+buf0, dest, nbyte, nsamp_get*itemsize, (sstart-samp0)*itemsize, quantum, npy_type, itemsize, algo };
 				worklist.push_back(work);
 			}
 		}
@@ -822,10 +827,10 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 
 static PyObject * start_async_read_py(PyObject * self, PyObject * args) {
 	const char * fname;
-	Py_buffer pybuf;
-	if(!PyArg_ParseTuple(args, "sy*", &fname, &pybuf)) return NULL;
+	Py_autobuf pybuf;
+	if(!PyArg_ParseTuple(args, "sy*", &fname, &pybuf.pb)) return NULL;
 	std::shared_ptr<AioTask> task;
-	try { task = start_async_read(fname, (char*)pybuf.buf, pybuf.len); }
+	try { task = start_async_read(fname, (char*)pybuf.pb.buf, pybuf.pb.len); }
 	catch(const std::exception & e) {
 		PyErr_SetString(PyExc_IOError, e.what());
 		return NULL;

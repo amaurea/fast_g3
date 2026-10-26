@@ -452,7 +452,7 @@ def _get_active_files(fnames, samps=None, file_nsamps=None, allow_none=False):
 		# Make sure there's at least one active file
 		if len(ofnames) == 0 and not allow_none:
 			ofnames = fnames[:1]
-			sranges = (0,1)
+			sranges = [(0,1)]
 		return ofnames, sranges
 
 # Consider replacing the long list of lists interface to

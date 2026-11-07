@@ -2,6 +2,44 @@ from .fast_g3_core import scan, extract, start_async_read, end_async_read
 from contextlib import contextmanager
 import numpy as np, os, time
 
+"""fast_g3: Read the .g3 file format used by Simons Observatory.
+
+Low-level interface:
+
+	# 1. Read in the whole file
+	with open(fname, "rb") as ifile:
+		data = ifile.read()
+	# 2. Scan it to determine its structure. Does a small amount of decoding work for
+	# "simple" fields too
+	info = fast_g3.scan(data)
+	# info is a dict contining
+	#  nsamp: number of samples (max across all fields in case they differ)
+	#  fields: A dict of the fields in the file. The key is the field name,
+	#    e.g. "ancil/az_enc", and value is a dict with the form:
+	#    dtype: numpy data type of the field
+	#    shape: 1d (nsamp,) or 2d (ndet,nsamp) shape of the field.
+	#      The 2d case does not have to be detectors.
+	#    names: Names for each detector, if any. Can be empty
+	#    segments: Array [nseg,8] with information about how do
+	#      load each segment of the field from the different frames
+	#      in the g3 file. Used by fast_g3.extract()
+	#  frames: Information about the individual frames, including some
+	#    data that did not fit into the frame format. This is a bit ad-hoc
+	# 3. Describe the fields to be read out. In this example we will
+	# read in ancil/az_enc and signal/times
+	request = {
+		"ancil/az_enc":{"oarr": np.zeros(info["fields"]["ancil/az_enc"]["shape"], info["fields"]["ancil/az_enc"]["dtype"])},
+		"signal/times":{"oarr": np.zeros(info["fields"]["signal/times"]["shape"], info["fields"]["signal/times"]["dtype"])},
+	}
+	fast_g3.extract(data, info, request)
+	# 4. Data is now in request["ancil/az_enc"]["oarr"] and request["signal/times"]["oarr"]
+
+High-level interface:
+	This one is much easier to use.
+	See the G3File docstring.
+"""
+
+
 class G3File:
 	"""G3File: High-level interface for fast_g3.
 
@@ -101,12 +139,55 @@ class G3File:
 		with self._timer("extract"):
 			extract(self._reader.buf, self._meta, self._queue)
 		# Format output
-		result = {name:request["oarr"] for name,request in self._queue.items()}
+		result = unrequest(self._queue)
 		# Add frames to result. This would cause a collision if one of our
 		# main fields has a name "frames", but this is unlikely
 		result["frames"] = self._meta["frames"]
 		self._queue = {}
 		return result
+	def read_tsmap(self, fnames_or_prefix, ctime=True, keep_prefix=False):
+		"""This is a specialized function for reading the somewhat messy G3TimesampleMaps (tsmaps) used
+		in SO housekeeping.
+
+		In theory these are a set of co-sampled timestreams with a shared
+		time axis, but in practice different data frames can contain the same-name tsmap with different
+		subsets of members present, and even with different sample rates. This plays poorly with the
+		concatenation across frames that fast_g3 does. This function undoes the mess this creates, returning
+		a {fname:{"ctime":ctime, "data":data}, ...} for each field in the tsmap, except the time axis which
+		is folded into the per-field ctime information (it needs to be per-field because they aren't necessarily
+		co-sampled after all once muliple frames are merged). Since this function excplicitly deals with
+		time, it also by default decodes raw time into ctime.
+
+		Unlike the more general read(), this function only deals with a single tsmap at a time, and not
+		other G3 data structures. If fnames_or_prefix is a single string, then it is taken to be the
+		prefix for a tsmap. Otherwise, it should be a list of full names for the members to read out.
+		The time-field can be left out, since it will be inferred.
+
+		Example: Reading in all the sensor data in the file
+		  tsmap = g3file.read_tsmap("blocks/sens")
+			# tsmap["AIN0V"]["ctime"] and tsmap["AIN0V"]["data"] will have the timestamps and data of the
+			# AINV0 sensor respectively, if it was present in this file
+		Example: Reading in only the corrected az and el data from housekeeping
+		  tsmap = g3file.read_tsmap(["blocks/ACU_broadcast/Corrected_Azimuth", "blocks/ACU_broadcast/Corrected_Elevation"])
+			# tsmap["Corrected_Azimuth"]["ctime"] and tsmap["Corrected_Azimuth"]["data"] will have
+			# the ctime and values of azimuth. In this case the ctime information in Corrected_Elevation
+			# will be redundant because unlike the "sens" data, these are always present together.
+		"""
+		# Get the list of field names
+		if isinstance(fnames_or_prefix, str):
+			prefix = fnames_or_prefix
+			if not prefix.endswith("/"): prefix += "/"
+			fnames = match_prefix(self.fields.keys(), prefix)
+		else: fnames = fnames_or_prefix
+		# Build the request and read in the data
+		info    = self._meta
+		request = {fname:{"oarr":np.zeros(info["fields"][fname]["shape"], info["fields"][fname]["dtype"])} for fname in fnames}
+		extract(self._reader.buf, info, request)
+		# Unmangle it and return
+		segdata = unrequest(request)
+		tsmap   = finish_tsmap(segdata, info, ctime=ctime)
+		if not keep_prefix: tsmap = unprefix(tsmap)
+		return tsmap
 	def __repr__(self):
 		fieldnames = sorted(self.fields.keys())
 		nchar      = max([len(fn) for fn in fieldnames])+2
@@ -454,6 +535,74 @@ def _get_active_files(fnames, samps=None, file_nsamps=None, allow_none=False):
 			ofnames = fnames[:1]
 			sranges = [(0,1)]
 		return ofnames, sranges
+
+def unrequest(req):
+	"""Go from {fname:{"oarr":arr, ...}} to {fname:arr}"""
+	return {fname:val["oarr"] for fname, val in req.items()}
+
+# Helper functions for dealing with the somewhat wonky timestream data used in
+# SO housekeeping
+
+def cat_segs(iarr, segs):
+	"""Given an array iarr[...,nsamp] of data for a single field, such as
+	what's returned by G3File.read_field, return a new array containing just
+	the parts of the data in the given list of segments from field["segments"],
+	returnint it as a single array."""
+	onsamp = np.sum(segs[:,2])
+	oarr   = np.zeros(iarr.shape[:-1]+(onsamp,), iarr.dtype)
+	opos   = 0
+	for seg in segs:
+		ipos, nsamp = seg[1:3]
+		oarr[...,opos:opos+nsamp] = iarr[...,ipos:ipos+nsamp]
+		opos += nsamp
+	return oarr
+
+def find_tname(fnames):
+	"""Given a list of field names referring to the members of a G3TimestreamMap,
+	infer which of them is their shared time axis and return its name"""
+	for fname in fnames:
+		if fname.endswith("/times"):
+			return fname
+
+def unprefix(data):
+	"""Like doing os.path.basename on each key in data. Can be useful for
+	shortening excessively long field names when one only care about
+	the base names."""
+	return {key.split("/")[-1]:val for key,val in data.items()}
+
+def finish_tsmap(segdata, info, tname=None, dedup=True, ctime=True):
+	"""All sensors share a single time field because they were all in G3TimesampleMaps with
+	the same name "sens". That's a problem beause some were sampled at a different sample
+	rate. To fix this, will recover individual # time axes per field."""
+	if tname is None: tname = find_tname(segdata.keys())
+	tsegs  = info["fields"][tname]["segments"]
+	# Turn into normal ctime
+	if ctime: itimes = segdata[tname]*1e-8
+	else:     itimes = segdata[tname]
+	out    = {}
+	for fname, idata in segdata.items():
+		if fname == tname: continue
+		mysegs = info["fields"][fname]["segments"]
+		# Index into time-segments for each of our segments
+		tinds  = np.searchsorted(tsegs[:,7], mysegs[:,7])
+		if np.any(tsegs[tinds,7] != mysegs[:,7]):
+			raise ValueError("Field %s's segments are not a subset of time-field %s's" % (fname, tname))
+		# Apparently some frames are repeated. Get rid of these repeats.
+		if dedup:
+			tstarts   = itimes[tsegs[tinds,1]]
+			_, myinds = np.unique(tstarts, return_index=True)
+			tinds = tinds[myinds]
+		else:
+			myinds = np.arange(len(mysegs))
+		odata  = cat_segs(idata,  mysegs[myinds])
+		otimes = cat_segs(itimes, tsegs [tinds])
+		out[fname] = {"data":odata, "ctime":otimes}
+	return out
+
+def match_prefix(fnames, prefix):
+	"""Return all the fnames in fnames that start with the given prefix. Useful for
+	finding e.g. all the members of a tsmap."""
+	return [fname for fname in fnames if fname.startswith(prefix)]
 
 # Consider replacing the long list of lists interface to
 # G3MultiMuliFile with a minimal constructor, and then

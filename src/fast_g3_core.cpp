@@ -17,6 +17,8 @@
   #define PyDataType_ELSIZE(descr) ((descr)->elsize)
 #endif
 
+#undef DEBUG
+
 // Need to make some changes with how the detectors are handled.
 // I thought any 2-axis array would have detectors as the first
 // axis, but that's wrong. Only supertimestreams have two axes,
@@ -65,18 +67,22 @@
 
 using std::string;
 using std::vector;
-enum class FType { None, G3Int, G3Double, G3String, G3Time, G3VectorInt8, G3VectorInt16, G3VectorInt32, G3VectorInt64, G3VectorDouble, G3VectorBool, G3TimesampleMap, G3SuperTimestream };
-struct Segment     { int64_t row, samp0, nsamp, buf0, nbyte; double quantum; uint8_t algo; };
+using std::unordered_map;
+
+enum class FType { None, G3Int, G3Double, G3String, G3Time, G3VectorInt8, G3VectorInt16, G3VectorInt32, G3VectorInt64, G3VectorDouble, G3VectorBool, G3VectorTime, G3VectorString, G3VectorFrameObject, G3TimesampleMap, G3SuperTimestream, G3TimestreamMap, G3MapFrameObject, G3Vector, G3FrameObject, G3VectorInt };
+struct ClassReg { unordered_map<int32_t, string> names; unordered_map<FType,int32_t> versions; };
+struct Segment     { int64_t row, samp0, nsamp, buf0, nbyte, frame; double quantum; uint8_t algo; };
 struct SimpleField { int64_t buf0, nbyte; string name; FType type; };
 typedef vector<Segment> Segments;
 typedef vector<string> Names;
 struct Field    { int npy_type, ndim; int64_t nsamp; Names names; Segments segments; };
 typedef vector<SimpleField> SimpleFields;
-struct Frame    { int32_t type; SimpleFields simple_fields; };
+struct Frame    { int32_t type, index; SimpleFields simple_fields; };
 typedef vector<Frame> Frames;
-typedef std::unordered_map<string,Field> Fields;
+typedef unordered_map<string,Field> Fields;
+struct Hack { Names block_names; };
 struct ScanInfo {
-	Fields fields; Frames frames;
+	Fields fields; Frames frames; Hack hack;
 };
 struct Work { const void *ibuf; void *obuf; int64_t inbyte, onbyte, oskip; double quantum; int npy_type, itemsize; uint8_t algo; };
 typedef vector<Work> WorkList;
@@ -104,7 +110,7 @@ string fmt(const char * format, ...) {
 	string msg(n, '\0');
 	// And fill it
 	va_start(ap, format);
-	vsnprintf(msg.data(), n, format, ap);
+	vsnprintf(msg.data(), n+1, format, ap);
 	va_end(ap);
 	return msg;
 }
@@ -214,6 +220,40 @@ struct FlacDecoder {
 	FLAC__StreamDecoder *decoder;
 };
 
+// Pass in a buffer pointed to the first of nelem [int32 n, char chars[n]]
+// length-string pairs. Helper function for vecstring2cpp. It's called 2cpp
+// because it returns the natural c++ reprsentation of the data, as opposed to
+// a numpy format.
+vector<string> strings2cpp(Buffer & buf, int64_t nelem) {
+	vector<string> strings;
+	strings.reserve(nelem);
+	for(int64_t i = 0; i < nelem; i++) {
+		int64_t n = buf.read<int64_t>();
+		strings.push_back(buf.read_string(n));
+	}
+	return strings;
+}
+
+// Pass in a buffer pointing to the beginning of the body of a
+// G3VectorString, so after all the type and version information.
+// This is the entry givin the number of elements in the vector
+vector<string> vecstring2cpp(Buffer & buf) {
+	int64_t nelem = buf.read<int64_t>();
+	return strings2cpp(buf, nelem);
+}
+
+PyObject * vecstring2py(Buffer & buf) {
+	int64_t nelem = buf.read<int64_t>();
+	PyHandle list = PyList_New(nelem); if(!list) return NULL;
+	for(int64_t i = 0; i < nelem; i++) {
+		int64_t n = buf.read<int64_t>();
+		PyObject * s = PyUnicode_FromStringAndSize(buf.data+buf.pos, n); if(!s) return NULL;
+		PyList_SET_ITEM(list.ptr, i, s);
+		buf.pos += n;
+	}
+	return list.defuse();
+}
+
 // Why isn't there a numpy function for this?
 int numpy_type_size(int npy_type) {
 	switch(npy_type) {
@@ -224,6 +264,137 @@ int numpy_type_size(int npy_type) {
 		case 15: return 16;
 	}
 	return 0;
+}
+
+// Return the numpy type corresponding to a given ftype.
+// Does not distinguish between individual values and vectors.
+// Returns -1 for values that do not have a simple correspondence
+int ftype2npy(FType ftype) {
+	switch(ftype) {
+		case FType::G3Int:
+		case FType::G3Time:
+		case FType::G3VectorInt64:
+		case FType::G3VectorTime:
+			return NPY_INT64;
+		case FType::G3VectorDouble:
+		case FType::G3Double:
+			return NPY_DOUBLE;
+		case FType::G3VectorInt8:
+		case FType::G3VectorBool:
+			return NPY_INT8;
+		case FType::G3VectorInt16:
+			return NPY_INT16;
+		case FType::G3VectorInt32:
+			return NPY_INT32;
+		default:
+			return -1;
+	}
+}
+
+void skip_endian(Buffer & buf) { buf.pos += 1; }
+
+// Functions for keeping track of cereal state. Which is needed to handle
+// variable-length sections with no explicit length information
+string get_type_name(Buffer & buf, ClassReg & reg) {
+	int32_t id = buf.read<int32_t>();
+	bool isnew = id & 0x80000000;
+	id &= 0x7fffffff;
+	if(isnew) {
+		int64_t len = buf.read<int64_t>();
+		string type_name = buf.read_string(len);
+		reg.names[id] = type_name;
+		return type_name;
+	} else {
+		return reg.names[id];
+	}
+}
+
+FType decode_type_name(const string & type_name) {
+	if(type_name == "G3TimesampleMap") return FType::G3TimesampleMap;
+	else if(type_name == "G3SuperTimestream") return FType::G3SuperTimestream;
+	else if(type_name == "G3Int")    return FType::G3Int;
+	else if(type_name == "G3Time")   return FType::G3Time;
+	else if(type_name == "G3Double") return FType::G3Double;
+	else if(type_name == "G3String") return FType::G3String;
+	else if(type_name == "G3VectorDouble") return FType::G3VectorDouble;
+	else if(type_name == "G3VectorInt") return FType::G3VectorInt; // Will be specialized later
+	else if(type_name == "G3VectorBool") return FType::G3VectorBool;
+	else if(type_name == "G3VectorString") return FType::G3VectorString;
+	else if(type_name == "G3VectorFrameObject") return FType::G3VectorFrameObject;
+	else if(type_name == "G3MapFrameObject") return FType::G3MapFrameObject;
+	else return FType::None; // Unhandled type
+}
+
+FType vector_int_subtype(int itemsize) {
+	if     (itemsize == 1) return FType::G3VectorInt8;
+	else if(itemsize == 2) return FType::G3VectorInt16;
+	else if(itemsize == 4) return FType::G3VectorInt32;
+	else if(itemsize == 8) return FType::G3VectorInt64;
+	else return FType::None;
+}
+
+void check_data_ptr(Buffer & buf) {
+	int32_t id = buf.read<int32_t>();
+	bool isnew = id & 0x80000000;
+	id &= 0x7fffffff;
+	if(!isnew)
+		throw std::runtime_error("Data reuse in not implemented in fast_g3");
+}
+
+void handle_version(Buffer & buf, ClassReg & reg, FType ftype) {
+	if(!reg.versions.contains(ftype)) {
+		// This class type's version has never been registered before
+		int32_t version = buf.read<int32_t>();
+		reg.versions[ftype] = version;
+	}
+	// Otherwise we don't try to read it in
+}
+
+void handle_version_tree(Buffer & buf, ClassReg & reg, FType ftype) {
+	switch(ftype) {
+		case FType::G3FrameObject:
+			handle_version(buf, reg, ftype);
+			break;
+		case FType::G3Int:
+		case FType::G3Double:
+		case FType::G3String:
+		case FType::G3Time:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3FrameObject);
+			break;
+		case FType::G3VectorInt:
+		case FType::G3VectorInt8:
+		case FType::G3VectorInt16:
+		case FType::G3VectorInt32:
+		case FType::G3VectorInt64:
+			handle_version(buf, reg, FType::G3VectorInt);
+			handle_version(buf, reg, FType::G3FrameObject);
+		case FType::G3VectorDouble:
+		case FType::G3VectorTime:
+		case FType::G3VectorBool:
+		case FType::G3VectorString:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3FrameObject);
+		case FType::G3VectorFrameObject:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3FrameObject);
+			break;
+		case FType::G3MapFrameObject:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3FrameObject);
+			break;
+		case FType::G3TimesampleMap:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3MapFrameObject);
+			handle_version(buf, reg, FType::G3FrameObject);
+			break;
+		case FType::G3SuperTimestream:
+			handle_version(buf, reg, ftype);
+			handle_version(buf, reg, FType::G3FrameObject);
+			break;
+		default:
+			throw std::runtime_error("Unhandled frame type");
+	}
 }
 
 // unordered_map only got contains() in C++20, so use this to be safe}
@@ -240,41 +411,67 @@ Field & get_field(Fields & fields, const string & name, int npy_type, int ndim) 
 	return fields[name];
 }
 
-void process_timesamplemap(Buffer & buf, int32_t nfield, const string & prefix, ScanInfo & sinfo) {
-	for(int32_t fi = 0; fi < nfield; fi++) {
+void process_timesamplemap(Buffer & buf, const string & prefix, ScanInfo & sinfo, ClassReg & reg, int32_t iframe) {
+	int32_t nfield = buf.read<int32_t>();
+	int64_t val_len = 0;
+	for(int32_t fi = 0; fi < nfield; fi++, buf.pos += val_len) {
+		ClassReg subreg;
 		int64_t field_name_len = buf.read<int64_t>();
-		string field_name       = prefix + buf.read_string(field_name_len);
-		int64_t val_len        = buf.read<int64_t>();
+		string field_name      = prefix + buf.read_string(field_name_len);
+		val_len                = buf.read<int64_t>();
 		// Handle value
 		Buffer subbuf(buf);
-		subbuf.pos += 5;
-		int64_t type_name_len  = subbuf.read<int64_t>();
-		string type_name        = subbuf.read_string(type_name_len);
-
-		int npy_type = -1;
-		if(type_name == "G3VectorDouble") npy_type = NPY_DOUBLE;
-		if(npy_type >= 0) {
-			subbuf.pos += 12;
-			Segment seg;
-			Field & field = get_field(sinfo.fields, field_name, npy_type, 1);
-			seg.row   = -1;
-			seg.samp0 = field.nsamp;
-			seg.nsamp = subbuf.read<int64_t>();
-			seg.nbyte = seg.nsamp*numpy_type_size(npy_type);
-			seg.buf0  = subbuf.pos;
-			seg.quantum=0;
-			seg.algo  = 0;
-			// Insert into field
-			field.segments.push_back(seg);
-			field.nsamp += seg.nsamp;
+		skip_endian(subbuf);
+		string type_name = get_type_name(subbuf, subreg);
+		FType ftype = decode_type_name(type_name);
+		if(ftype == FType::None) continue;
+		check_data_ptr(subbuf);
+		handle_version_tree(subbuf, subreg, ftype);
+		// Expand G3VectorInt
+		if(ftype == FType::G3VectorInt) {
+			int32_t itemsize = subbuf.read<int32_t>()/8;
+			ftype = vector_int_subtype(itemsize);
 		}
-		buf.pos += val_len;
+		#ifdef DEBUG
+			printf(" %-22s %22s pos %lx\n", field_name.c_str(), type_name.c_str(), subbuf.pos);
+		#endif
+		int npy_type = ftype2npy(ftype);
+		// NB: We silently ignore types we can't handle. This is mainly G3VectorString,
+		// which must be fully parsed to get nbyte and in general do not map cleanly to numpy
+		if(npy_type < 0) continue;
+		Segment seg;
+		Field & field = get_field(sinfo.fields, field_name, npy_type, 1);
+		seg.row   = -1;
+		seg.samp0 = field.nsamp;
+		seg.nsamp = subbuf.read<int64_t>();
+		seg.nbyte = seg.nsamp*numpy_type_size(npy_type);
+		seg.buf0  = subbuf.pos;
+		seg.quantum=0;
+		seg.algo  = 0;
+		seg.frame = iframe;
+		// Insert into field
+		field.segments.push_back(seg);
+		field.nsamp += seg.nsamp;
 	}
+	FType ftype = FType::G3VectorTime;
+	handle_version_tree(buf, reg, ftype);
+	int64_t nsamp = buf.read<int64_t>();
+	handle_version_tree(buf, reg, FType::G3Time);
+	Field & field = get_field(sinfo.fields, prefix + "times", NPY_INT64, 1);
+	#ifdef DEBUG
+		printf(" %-22s %22s pos %lx\n", (prefix+"times").c_str(), "G3VectorTime", buf.pos);
+	#endif
+	Segment seg = {
+		.row = -1, .samp0 = field.nsamp, .nsamp = nsamp,
+		.buf0 = buf.pos, .nbyte = nsamp*numpy_type_size(NPY_INT64),
+		.frame = iframe, .quantum = 0, .algo = 0 };
+	field.segments.push_back(seg);
+	field.nsamp += nsamp;
+	buf.pos += seg.nbyte;
 }
 
-void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo) {
+void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo, int32_t iframe) {
 	// Skip unknown stuff
-	buf.pos += 12;
 	uint8_t flac_level       = buf.read<uint8_t>();   (void)flac_level;
 	uint8_t bsz_workfactor   = buf.read<uint8_t>();   (void)bsz_workfactor;
 	uint8_t times_algo       = buf.read<uint8_t>();   (void)times_algo;
@@ -284,7 +481,8 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 	// The -4,+4 is because the decoder considers the starting length tag to be
 	// part of the input buffer
 	Field & tfield = get_field(sinfo.fields, name+"/times", NPY_INT64, 1);
-	Segment tseg = { -1, tfield.nsamp, nsamp, buf.pos-4, times_nbyte_comp+4, 0.0, times_algo };
+	Segment tseg = { .row = -1, .samp0 = tfield.nsamp, .nsamp = nsamp, .buf0 = buf.pos-4, 
+		.nbyte = times_nbyte_comp+4, .frame = iframe, .quantum = 0.0, .algo = times_algo };
 	tfield.segments.push_back(tseg);
 	tfield.nsamp += nsamp;
 	buf.pos += times_nbyte_comp;
@@ -347,75 +545,168 @@ void process_supertimestream(Buffer & buf, const string & name, ScanInfo & sinfo
 		tot_size = none_size + flac_size + bz_size + const_size; (void)tot_size;
 		// Ok, done parsing this row
 		double quantum = nquanta > 0 ? quanta[ni] : 1.0;
-		Segment seg = { ni, field.nsamp, nsamp, row_start, row_end-row_start, quantum, used_algo };
+		Segment seg = { .row = ni, .samp0 = field.nsamp, .nsamp = nsamp, .buf0 = row_start,
+			.nbyte = row_end-row_start, .frame = iframe, .quantum = quantum, .algo = used_algo };
 		field.segments.push_back(seg);
 	}
 	field.nsamp += nsamp;
 	buf.pos += signal_nbyte_comp;
 }
 
-void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo, Frame & frame) {
-	for(int fi = 0; fi < nfield; fi++) {
-		int64_t field_name_len = buf.read<int64_t>();
-		string field_name       = buf.read_string(field_name_len);
-		int64_t val_len        = buf.read<int64_t>();
-		// Handle the value
-		Buffer subbuf(buf);
-		subbuf.pos += 5;
-		int64_t type_name_len  = subbuf.read<int64_t>();
-		string type_name        = subbuf.read_string(type_name_len);
-		FType ftype = FType::None;
-		int64_t nbyte;
-		// First the cases we handle specially. These have samples as
-		// their last axis, and will be concatenated into big arrays.
-		if(type_name == "G3TimesampleMap") {
-			subbuf.pos += 16;
-			int32_t subfields = subbuf.read<int32_t>();
-			process_timesamplemap(subbuf, subfields, field_name + "/", sinfo);
-		} else if(type_name == "G3SuperTimestream") {
-			process_supertimestream(subbuf, field_name, sinfo);
-		} else {
-			// Remaning field types here
-			subbuf.pos += 12;
-			if     (type_name == "G3Int")   { ftype = FType::G3Int;    nbyte = 8; }
-			else if(type_name == "G3Time")  { ftype = FType::G3Time;   nbyte = 8; }
-			else if(type_name == "G3Double"){ ftype = FType::G3Double; nbyte = 8; }
-			else if(type_name == "G3String"){ ftype = FType::G3String; nbyte = subbuf.read<int64_t>(); }
-			else if(type_name == "G3VectorDouble") { ftype = FType::G3VectorDouble; nbyte = subbuf.read<int64_t>()*8; }
-			else if(type_name == "G3VectorInt") {
-				int32_t itemsize = subbuf.read<int32_t>()/8;
-				nbyte = subbuf.read<int64_t>()*itemsize;
-				if     (itemsize == 1) ftype = FType::G3VectorInt8;
-				else if(itemsize == 2) ftype = FType::G3VectorInt16;
-				else if(itemsize == 4) ftype = FType::G3VectorInt32;
-				else if(itemsize == 8) ftype = FType::G3VectorInt64;
-				else {
-					// Invalid field. Ignore for now
-				}
-			}
-			else if(type_name == "G3VectorBool") { ftype = FType::G3VectorBool; nbyte = subbuf.read<int64_t>()*1; }
-			else {
-				// Unknown type. Just ignore for now
-			}
-		}
-		buf.pos += val_len;
-		// Append non-sample fields to frame
-		if(ftype != FType::None) {
-			SimpleField simple_field = { subbuf.pos, nbyte, field_name, ftype };
-			frame.simple_fields.push_back(simple_field);
+int process_field(Buffer & buf, const string & prefix, ScanInfo & sinfo, Frame & frame, ClassReg & reg);
+
+void process_vectorframe(Buffer & buf, const string & prefix, ScanInfo & sinfo, Frame & frame, ClassReg & reg) {
+	int64_t n = buf.read<int64_t>();
+	bool block_hack = prefix == "blocks/";
+	if(block_hack && sinfo.hack.block_names.size() != (size_t)n) {
+		fprintf(stderr, "g3_fast block remapping failure: block size is %ld but block_names is %ld. Skipping blocks\n", n, sinfo.hack.block_names.size());
+		return;
+	}
+	for(int64_t i = 0; i < n; i++) {
+		string field_name = block_hack ? prefix + sinfo.hack.block_names[i] : fmt("%s%d", prefix.c_str(), i);
+		if(!process_field(buf, field_name, sinfo, frame, reg)) {
+		#ifdef DEBUG
+			printf(" Aborting vectorframe %s after %s (%ld)\n", prefix.c_str(), field_name.c_str(), i);
+		#endif
+			break; // Can't continue if we don't know where to continue on from
 		}
 	}
+}
+
+// This seems to be identical to process fields, aside from the interface. TODO: Merge
+void process_mapframe(Buffer & buf, const string & prefix, ScanInfo & sinfo, Frame & frame, ClassReg & reg) {
+	int32_t n = buf.read<int32_t>();
+	for(int32_t i = 0; i < n; i++) {
+		int64_t field_name_len = buf.read<int64_t>();
+		string field_name      = prefix + buf.read_string(field_name_len);
+		int64_t val_len        = buf.read<int64_t>();
+		// Process field in a sub-buffer, so we can easily skip over it without
+		// messing things up. 
+		Buffer subbuf(buf);
+		ClassReg subreg;
+		skip_endian(subbuf);
+		process_field(subbuf, field_name, sinfo, frame, subreg);
+		buf.pos += val_len;
+	}
+}
+
+void process_fields(Buffer & buf, int32_t nfield, ScanInfo & sinfo, Frame & frame) {
+	for(int fi = 0; fi < nfield; fi++) {
+		// This all happens in a subarchive, so start with a clean ClassReg
+		// Subarchive starts with endianness info
+		int64_t field_name_len = buf.read<int64_t>();
+		string field_name      = buf.read_string(field_name_len);
+		int64_t val_len        = buf.read<int64_t>();
+		// Process field in a sub-buffer, so we can easily skip over it without
+		// messing things up. 
+		Buffer subbuf(buf);
+		ClassReg reg;
+		skip_endian(subbuf);
+		process_field(subbuf, field_name, sinfo, frame, reg);
+		buf.pos += val_len;
+	}
+}
+
+// The problem with the housekeeping data in G3VectorFrameObjects is that
+// fields with the same name in different frames don't necessarily have
+// anything to do with each other. A commmon structure seems to be
+// "blocks", which consists of a vector of G3TimesampleMaps with
+// and a separate "block_names" G3VectorString with each block's name.
+// Why isn't this a G3MapFrameObject instead?
+//
+// Questions:
+// * Would block entries with the same block_name match up across frames?
+//   It looks likely that this is the case. If so, it might be worth it
+//   to fudge things by special_casing block_names and blocks.
+// * Are there any other cases that need merging too?
+// * How should I handle G3VectorString? Simple format, but variable-length.
+//   If it does not map cleanly to a numpy type, then will be expensive to
+//   decode.
+
+
+// There are two types of fields. Full Fields and SimpleFields.
+// The difference is that full Fields can span multiple frames,
+// consisting of segments, while SimpleFields are independent between frames.
+
+// returns 1 if the whole field was processed, 0 otherwise.
+// Needed by process_vectorframe, since vectorframes don't contain any information
+// about how long the frames are
+int process_field(Buffer & buf, const string & field_name, ScanInfo & sinfo, Frame & frame, ClassReg & reg) {
+	// Handle the value
+	string type_name = get_type_name(buf, reg);
+	#ifdef DEBUG
+		printf("%-22s %22s pos %lx\n", field_name.c_str(), type_name.c_str(), buf.pos);
+	#endif
+	FType ftype = decode_type_name(type_name);
+	if(ftype == FType::None) return 0;
+	// Ok, this is a type we will handle
+	check_data_ptr(buf);
+	handle_version_tree(buf, reg, ftype);
+	// OK, handle each type
+	if(ftype == FType::G3SuperTimestream) {
+		process_supertimestream(buf, field_name, sinfo, frame.index);
+	} else if(ftype == FType::G3TimesampleMap) {
+		process_timesamplemap(buf, field_name + "/", sinfo, reg, frame.index);
+	} else if(ftype == FType::G3VectorFrameObject) {
+		process_vectorframe(buf, field_name + "/", sinfo, frame, reg);
+	} else if(ftype == FType::G3MapFrameObject) {
+		process_mapframe(buf, field_name + "/", sinfo, frame, reg);
+	} else {
+		// The rest are classified as "simple fields" for now
+		int64_t nbyte = 0;
+		if(ftype == FType::G3Int || ftype == FType::G3Time || ftype == FType::G3Double)
+			nbyte  = 8;
+		else if(ftype == FType::G3String)
+			nbyte = buf.read<int64_t>();
+		else if(ftype == FType::G3VectorDouble)
+			nbyte = buf.read<int64_t>()*8;
+		else if(ftype == FType::G3VectorBool)
+			nbyte = buf.read<int64_t>()*1;
+		else if(ftype == FType::G3VectorInt) {
+			// Expand G3VectorInt
+			int32_t itemsize = buf.read<int32_t>()/8;
+			int64_t nitem    = buf.read<int64_t>();
+			ftype = vector_int_subtype(itemsize);
+			if(ftype == FType::None) return 0;
+			nbyte = nitem*itemsize;
+		} else if(ftype == FType::G3VectorString) {
+			if(field_name == "block_names") {
+				sinfo.hack.block_names = vecstring2cpp(buf);
+				// Return 0 to indicate we did not consume the field
+				return 0;
+			} else {
+				// printf("Found G3VectorString %s with length %ld\n", field_name.c_str(), *(int64_t*)(buf.data+buf.pos));
+				// Other G3VectorStrings will be registered as a SimpleField
+				// with nbyte = 0, since that information isn't available,
+				// but enough information to read it still exists.
+			}
+		} else { return 0; } // Ignore
+		// Register this simple field
+		SimpleField simple_field = { buf.pos, nbyte, field_name, ftype };
+		frame.simple_fields.push_back(simple_field);
+		buf.pos += nbyte;
+		// nbyte is not set in cases where we don't know how big the field is without
+		// consuming it, which is the case for vector strings
+		if(!nbyte) return 0;
+	}
+	return 1;
 }
 
 ScanInfo scan(Buffer & buf, int32_t until_frame_type = -1) {
 	ScanInfo sinfo;
 	// Loop over frames in file
 	for(int framei = 0; buf.pos < buf.size; framei++) {
+		(void)framei;
 		Frame frame; // holds all frame data we don't extract into Fields
-		uint8_t foo1    = buf.read<uint8_t>(); (void)foo1;
+		uint8_t endian  = buf.read<uint8_t>(); (void)endian;
 		int32_t version = buf.read<int32_t>(); (void)version;
 		int32_t nfield  = buf.read<int32_t>(); (void)nfield;
 		frame.type      = buf.read<int32_t>();
+		frame.index     = framei;
+		#ifdef DEBUG
+			printf("Frame type: %c\n", frame.type);
+		#endif
+		// exit when we reach until_frame_type without processing it
 		if(frame.type == until_frame_type) break;
 		process_fields(buf, nfield, sinfo, frame);
 		sinfo.frames.push_back(frame);
@@ -591,9 +882,6 @@ const char * get_frame_type_name(int32_t code) {
 
 PyObject * array_copy_from_bytes(npy_intp nitem, int typenum, const void * ptr, int64_t nbyte) {
 	return PyArray_New(&PyArray_Type, 1, &nitem, typenum, NULL, (void*)ptr, 0, NPY_ARRAY_ENSURECOPY, NULL);
-	//PyObject * arr = PyArray_EMPTY(1, &nitem, typenum, 0); if(!arr) return NULL;
-	//memcpy(PyArray_GETPTR1((PyArrayObject*)arr,0), ptr, nbyte);
-	//return arr;
 }
 
 // Expand sinfo.frames into python objects
@@ -642,6 +930,11 @@ PyObject * expand_simple(const Frames & frames, Buffer buf) {
 				case FType::G3VectorBool:
 					value.ptr = array_copy_from_bytes(field.nbyte, NPY_BOOL, vptr, field.nbyte);
 					break;
+				case FType::G3VectorString: {
+					Buffer vbuf(buf); buf.pos = field.buf0;
+					value.ptr = vecstring2py(vbuf);
+					break;
+				}
 				default:
 					// Skip unknown
 					continue;
@@ -695,7 +988,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 			PyTuple_SET_ITEM(names.ptr, ni, pyname); // steals
 		}
 		// [nseg,6] int64_t numpy array for the segments
-		npy_intp segshape[2] = { (npy_intp)field.segments.size(), 7 };
+		npy_intp segshape[2] = { (npy_intp)field.segments.size(), 8 };
 		PyHandle segments = PyArray_ZEROS(2, segshape, NPY_INT64, 0);
 		for(unsigned int si = 0; si < field.segments.size(); si++) {
 			const Segment & seg = field.segments[si];
@@ -708,6 +1001,7 @@ static PyObject * scan_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 			// hack: store the float64 quantum in the int field
 			memcpy(&row[5], &seg.quantum, 8);
 			row[6] = seg.algo;
+			row[7] = seg.frame;
 		}
 		// Make field dict to add these to
 		PyHandle pyfield = PyDict_New();
@@ -783,7 +1077,7 @@ PyObject * extract_py(PyObject * self, PyObject * args, PyObject * kwargs) {
 		int64_t oend = ostart + PyArray_SHAPE(arr)[PyArray_NDIM(arr)-1];
 		// Loop through the segments
 		PyArrayObject * segments = (PyArrayObject*)PyDict_GetItemString(finfo, "segments"); if(!segments) return NULL;
-		if(PyArray_NDIM(segments) != 2 || PyArray_TYPE(segments) != NPY_INT64 || PyArray_DIM(segments,1) != 7) return NULL;
+		if(PyArray_NDIM(segments) != 2 || PyArray_TYPE(segments) != NPY_INT64 || PyArray_DIM(segments,1) < 7) return NULL;
 		npy_intp nseg = PyArray_DIM(segments,0);
 		for(npy_intp seg = 0; seg < nseg; seg++) {
 			int64_t row  = *(int64_t*)PyArray_GETPTR2(segments, seg, 0);

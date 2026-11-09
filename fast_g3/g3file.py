@@ -178,14 +178,19 @@ class G3File:
 			prefix = fnames_or_prefix
 			if not prefix.endswith("/"): prefix += "/"
 			fnames = match_prefix(self.fields.keys(), prefix)
-		else: fnames = fnames_or_prefix
+		else: fnames = fnames_or_prefix.copy()
+		# Make sure we have a time field
+		tname = find_tname(fnames)
+		if not tname:
+			tname = "/".join(fnames[0].split("/")[:-1]+["times"])
+			fnames.append(tname)
 		# Build the request and read in the data
 		info    = self._meta
 		request = {fname:{"oarr":np.zeros(info["fields"][fname]["shape"], info["fields"][fname]["dtype"])} for fname in fnames}
 		extract(self._reader.buf, info, request)
 		# Unmangle it and return
 		segdata = unrequest(request)
-		tsmap   = finish_tsmap(segdata, info, ctime=ctime)
+		tsmap   = finish_tsmap(segdata, info, tname=tname, ctime=ctime)
 		if not keep_prefix: tsmap = unprefix(tsmap)
 		return tsmap
 	def __repr__(self):
@@ -570,11 +575,22 @@ def unprefix(data):
 	the base names."""
 	return {key.split("/")[-1]:val for key,val in data.items()}
 
+
+# FIXME: Not only are various fields with different labels all mushed into
+# blocks (which I work around with a renaming hack), but some fields occur
+# with different sample rates, e.g. blocks/sens/AIN98V which had data both at
+# 1 Hz and 200 Hz! If there was a simple way to identify these cases, then I could
+# rename blocks into e.g. blocks_1Hz and blocks_200Hz. Could hackily get it from the
+# time axis, but that's very awkward. The best case would be if the frame itself had
+# something to distinguish it.
+
 def finish_tsmap(segdata, info, tname=None, dedup=True, ctime=True):
 	"""All sensors share a single time field because they were all in G3TimesampleMaps with
 	the same name "sens". That's a problem beause some were sampled at a different sample
 	rate. To fix this, will recover individual # time axes per field."""
-	if tname is None: tname = find_tname(segdata.keys())
+	if tname is None:
+		tname = find_tname(segdata.keys())
+		if tname is None: raise ValueError("Cannot infer tname from %s" % str(segdata.keys()))
 	tsegs  = info["fields"][tname]["segments"]
 	# Turn into normal ctime
 	if ctime: itimes = segdata[tname]*1e-8

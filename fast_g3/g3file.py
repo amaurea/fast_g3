@@ -179,6 +179,7 @@ class G3File:
 			if not prefix.endswith("/"): prefix += "/"
 			fnames = match_prefix(self.fields.keys(), prefix)
 		else: fnames = fnames_or_prefix.copy()
+		if len(fnames) == 0: raise KeyError("tsmap %s not found" % str(fnames_or_prefix))
 		# Make sure we have a time field
 		tname = find_tname(fnames)
 		if not tname:
@@ -189,8 +190,9 @@ class G3File:
 		request = {fname:{"oarr":np.zeros(info["fields"][fname]["shape"], info["fields"][fname]["dtype"])} for fname in fnames}
 		extract(self._reader.buf, info, request)
 		# Unmangle it and return
-		segdata = unrequest(request)
-		tsmap   = finish_tsmap(segdata, info, tname=tname, ctime=ctime)
+		tsmap  = unrequest(request)
+		if ctime: tsmap[tname] = tsmap[tname]*1e-8
+		#tsmap   = finish_tsmap(segdata, info, tname=tname, ctime=ctime)
 		if not keep_prefix: tsmap = unprefix(tsmap)
 		return tsmap
 	def __repr__(self):
@@ -584,37 +586,37 @@ def unprefix(data):
 # time axis, but that's very awkward. The best case would be if the frame itself had
 # something to distinguish it.
 
-def finish_tsmap(segdata, info, tname=None, dedup=True, ctime=True):
-	"""All sensors share a single time field because they were all in G3TimesampleMaps with
-	the same name "sens". That's a problem beause some were sampled at a different sample
-	rate. To fix this, will recover individual # time axes per field."""
-	if tname is None:
-		tname = find_tname(segdata.keys())
-		if tname is None: raise ValueError("Cannot infer tname from %s" % str(segdata.keys()))
-	tsegs  = info["fields"][tname]["segments"]
-	# Turn into normal ctime
-	if ctime: itimes = segdata[tname]*1e-8
-	else:     itimes = segdata[tname]
-	out    = {}
-	for fname, idata in segdata.items():
-		if fname == tname: continue
-		mysegs = info["fields"][fname]["segments"]
-		# Index into time-segments for each of our segments
-		tinds  = np.searchsorted(tsegs[:,7], mysegs[:,7])
-		if np.any(tsegs[tinds,7] != mysegs[:,7]):
-			raise ValueError("Field %s's segments are not a subset of time-field %s's" % (fname, tname))
-		# Apparently some frames are repeated. Get rid of these repeats.
-		if dedup:
-			tstarts   = itimes[tsegs[tinds,1]]
-			_, myinds = np.unique(tstarts, return_index=True)
-			tinds = tinds[myinds]
-		else:
-			myinds = np.arange(len(mysegs))
-		odata  = cat_segs(idata,  mysegs[myinds])
-		otimes = cat_segs(itimes, tsegs [tinds])
-		out[fname] = {"data":odata, "ctime":otimes}
-	return out
-
+#def finish_tsmap(segdata, info, tname=None, dedup=True, ctime=True):
+#	"""All sensors share a single time field because they were all in G3TimesampleMaps with
+#	the same name "sens". That's a problem beause some were sampled at a different sample
+#	rate. To fix this, will recover individual # time axes per field."""
+#	if tname is None:
+#		tname = find_tname(segdata.keys())
+#		if tname is None: raise ValueError("Cannot infer tname from %s" % str(segdata.keys()))
+#	tsegs  = info["fields"][tname]["segments"]
+#	# Turn into normal ctime
+#	if ctime: itimes = segdata[tname]*1e-8
+#	else:     itimes = segdata[tname]
+#	out    = {}
+#	for fname, idata in segdata.items():
+#		if fname == tname: continue
+#		mysegs = info["fields"][fname]["segments"]
+#		# Index into time-segments for each of our segments
+#		tinds  = np.searchsorted(tsegs[:,7], mysegs[:,7])
+#		if np.any(tsegs[tinds,7] != mysegs[:,7]):
+#			raise ValueError("Field %s's segments are not a subset of time-field %s's" % (fname, tname))
+#		# Apparently some frames are repeated. Get rid of these repeats.
+#		if dedup:
+#			tstarts   = itimes[tsegs[tinds,1]]
+#			_, myinds = np.unique(tstarts, return_index=True)
+#			tinds = tinds[myinds]
+#		else:
+#			myinds = np.arange(len(mysegs))
+#		odata  = cat_segs(idata,  mysegs[myinds])
+#		otimes = cat_segs(itimes, tsegs [tinds])
+#		out[fname] = {"data":odata, "ctime":otimes}
+#	return out
+#
 def match_prefix(fnames, prefix):
 	"""Return all the fnames in fnames that start with the given prefix. Useful for
 	finding e.g. all the members of a tsmap."""

@@ -17,7 +17,7 @@
   #define PyDataType_ELSIZE(descr) ((descr)->elsize)
 #endif
 
-#undef DEBUG
+//#define DEBUG
 
 // Need to make some changes with how the detectors are handled.
 // I thought any 2-axis array would have detectors as the first
@@ -80,7 +80,7 @@ typedef vector<SimpleField> SimpleFields;
 struct Frame    { int32_t type, index; SimpleFields simple_fields; };
 typedef vector<Frame> Frames;
 typedef unordered_map<string,Field> Fields;
-struct Hack { Names block_names; };
+struct Hack { Names block_names; string address; };
 struct ScanInfo {
 	Fields fields; Frames frames; Hack hack;
 };
@@ -558,12 +558,16 @@ int process_field(Buffer & buf, const string & prefix, ScanInfo & sinfo, Frame &
 void process_vectorframe(Buffer & buf, const string & prefix, ScanInfo & sinfo, Frame & frame, ClassReg & reg) {
 	int64_t n = buf.read<int64_t>();
 	bool block_hack = prefix == "blocks/";
+	if(block_hack && sinfo.hack.address.empty()) {
+		fprintf(stderr, "g3fast block_remapping failure: No address set\n");
+		return;
+	}
 	if(block_hack && sinfo.hack.block_names.size() != (size_t)n) {
 		fprintf(stderr, "g3_fast block remapping failure: block size is %ld but block_names is %ld. Skipping blocks\n", n, sinfo.hack.block_names.size());
 		return;
 	}
 	for(int64_t i = 0; i < n; i++) {
-		string field_name = block_hack ? prefix + sinfo.hack.block_names[i] : fmt("%s%d", prefix.c_str(), i);
+		string field_name = block_hack ? sinfo.hack.address + "/" + sinfo.hack.block_names[i] : fmt("%s%d", prefix.c_str(), i);
 		if(!process_field(buf, field_name, sinfo, frame, reg)) {
 		#ifdef DEBUG
 			printf(" Aborting vectorframe %s after %s (%ld)\n", prefix.c_str(), field_name.c_str(), i);
@@ -656,8 +660,11 @@ int process_field(Buffer & buf, const string & field_name, ScanInfo & sinfo, Fra
 		int64_t nbyte = 0;
 		if(ftype == FType::G3Int || ftype == FType::G3Time || ftype == FType::G3Double)
 			nbyte  = 8;
-		else if(ftype == FType::G3String)
+		else if(ftype == FType::G3String) {
 			nbyte = buf.read<int64_t>();
+			// Housekeeping hack
+			if(field_name == "address") { sinfo.hack.address = buf.read_string(nbyte); return 0; }
+		}
 		else if(ftype == FType::G3VectorDouble)
 			nbyte = buf.read<int64_t>()*8;
 		else if(ftype == FType::G3VectorBool)
@@ -670,11 +677,9 @@ int process_field(Buffer & buf, const string & field_name, ScanInfo & sinfo, Fra
 			if(ftype == FType::None) return 0;
 			nbyte = nitem*itemsize;
 		} else if(ftype == FType::G3VectorString) {
-			if(field_name == "block_names") {
-				sinfo.hack.block_names = vecstring2cpp(buf);
-				// Return 0 to indicate we did not consume the field
-				return 0;
-			} else {
+			// Housekeeping hack
+			if(field_name == "block_names") { sinfo.hack.block_names = vecstring2cpp(buf);  return 0; }
+			else {
 				// printf("Found G3VectorString %s with length %ld\n", field_name.c_str(), *(int64_t*)(buf.data+buf.pos));
 				// Other G3VectorStrings will be registered as a SimpleField
 				// with nbyte = 0, since that information isn't available,

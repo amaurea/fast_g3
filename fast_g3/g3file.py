@@ -149,29 +149,19 @@ class G3File:
 		"""This is a specialized function for reading the somewhat messy G3TimesampleMaps (tsmaps) used
 		in SO housekeeping.
 
-		In theory these are a set of co-sampled timestreams with a shared
-		time axis, but in practice different data frames can contain the same-name tsmap with different
-		subsets of members present, and even with different sample rates. This plays poorly with the
-		concatenation across frames that fast_g3 does. This function undoes the mess this creates, returning
-		a {fname:{"ctime":ctime, "data":data}, ...} for each field in the tsmap, except the time axis which
-		is folded into the per-field ctime information (it needs to be per-field because they aren't necessarily
-		co-sampled after all once muliple frames are merged). Since this function excplicitly deals with
-		time, it also by default decodes raw time into ctime.
-
 		Unlike the more general read(), this function only deals with a single tsmap at a time, and not
 		other G3 data structures. If fnames_or_prefix is a single string, then it is taken to be the
 		prefix for a tsmap. Otherwise, it should be a list of full names for the members to read out.
 		The time-field can be left out, since it will be inferred.
 
 		Example: Reading in all the sensor data in the file
-		  tsmap = g3file.read_tsmap("blocks/sens")
-			# tsmap["AIN0V"]["ctime"] and tsmap["AIN0V"]["data"] will have the timestamps and data of the
-			# AINV0 sensor respectively, if it was present in this file
+		  tsmap = g3file.read_tsmap("lat.env-labjack-inclinometer-m1.feeds.sensors")
+			# tsmap["times"] and tsmap["AIN67V"] will have the timestamps and data of the
+			# AIN67V sensor respectively, if it was present in this file
 		Example: Reading in only the corrected az and el data from housekeeping
-		  tsmap = g3file.read_tsmap(["blocks/ACU_broadcast/Corrected_Azimuth", "blocks/ACU_broadcast/Corrected_Elevation"])
-			# tsmap["Corrected_Azimuth"]["ctime"] and tsmap["Corrected_Azimuth"]["data"] will have
-			# the ctime and values of azimuth. In this case the ctime information in Corrected_Elevation
-			# will be redundant because unlike the "sens" data, these are always present together.
+		  tsmap = g3file.read_tsmap(["lat.acu.feeds.acu_udp_stream/ACU_broadcast/Corrected_Azimuth", "lat.acu.feeds.acu_udp_stream/ACU_broadcast/Corrected_Elevation"])
+			# tsmap["times"] and tsmap["Corrected_Azimuth"] will have
+			# the ctime and values of azimuth.
 		"""
 		# Get the list of field names
 		if isinstance(fnames_or_prefix, str):
@@ -577,46 +567,6 @@ def unprefix(data):
 	the base names."""
 	return {key.split("/")[-1]:val for key,val in data.items()}
 
-
-# FIXME: Not only are various fields with different labels all mushed into
-# blocks (which I work around with a renaming hack), but some fields occur
-# with different sample rates, e.g. blocks/sens/AIN98V which had data both at
-# 1 Hz and 200 Hz! If there was a simple way to identify these cases, then I could
-# rename blocks into e.g. blocks_1Hz and blocks_200Hz. Could hackily get it from the
-# time axis, but that's very awkward. The best case would be if the frame itself had
-# something to distinguish it.
-
-#def finish_tsmap(segdata, info, tname=None, dedup=True, ctime=True):
-#	"""All sensors share a single time field because they were all in G3TimesampleMaps with
-#	the same name "sens". That's a problem beause some were sampled at a different sample
-#	rate. To fix this, will recover individual # time axes per field."""
-#	if tname is None:
-#		tname = find_tname(segdata.keys())
-#		if tname is None: raise ValueError("Cannot infer tname from %s" % str(segdata.keys()))
-#	tsegs  = info["fields"][tname]["segments"]
-#	# Turn into normal ctime
-#	if ctime: itimes = segdata[tname]*1e-8
-#	else:     itimes = segdata[tname]
-#	out    = {}
-#	for fname, idata in segdata.items():
-#		if fname == tname: continue
-#		mysegs = info["fields"][fname]["segments"]
-#		# Index into time-segments for each of our segments
-#		tinds  = np.searchsorted(tsegs[:,7], mysegs[:,7])
-#		if np.any(tsegs[tinds,7] != mysegs[:,7]):
-#			raise ValueError("Field %s's segments are not a subset of time-field %s's" % (fname, tname))
-#		# Apparently some frames are repeated. Get rid of these repeats.
-#		if dedup:
-#			tstarts   = itimes[tsegs[tinds,1]]
-#			_, myinds = np.unique(tstarts, return_index=True)
-#			tinds = tinds[myinds]
-#		else:
-#			myinds = np.arange(len(mysegs))
-#		odata  = cat_segs(idata,  mysegs[myinds])
-#		otimes = cat_segs(itimes, tsegs [tinds])
-#		out[fname] = {"data":odata, "ctime":otimes}
-#	return out
-#
 def match_prefix(fnames, prefix):
 	"""Return all the fnames in fnames that start with the given prefix. Useful for
 	finding e.g. all the members of a tsmap."""
